@@ -39,6 +39,13 @@ cachecompress=false
 unicodelabels=true
 port=12433
 
+# PGN recording and replay
+pgnFile=""
+pgnMoveNum=0
+pgnBuffer=""
+replayFile=""
+replaySpeed=1
+
 # internal values
 timestamp=$( date +%s%N )
 fifopipeprefix="/tmp/chessbashpipe"
@@ -248,6 +255,11 @@ function help {
 	echo "    -n         Use normal (instead of color filled) figures"
 	echo "    -m         Disable color marking of possible moves"
 	echo
+	echo -e "\e[4mPGN recording and replay\e[0m"
+	echo -e "    --pgn \e[2mFILE\e[0m       Record game moves in PGN format to FILE"
+	echo -e "    --replay \e[2mFILE\e[0m    Replay a PGN file in the terminal (no AI/network)"
+	echo -e "    --replay-speed \e[2mN\e[0m  Auto-advance delay in seconds for replay (Default: $replaySpeed)"
+	echo
 	echo -e "\e[2m(Default values/options should suit most systems - only if you encounter a"
 	echo -e "problem you should have a further investigation of these script parameters."
 	echo -e "Or just switch to a real chess game with great graphics and ai! ;)\e[0m"
@@ -359,6 +371,27 @@ while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz" options; do
 		\?)
 			echo -e "Invalid option: -$OPTARG\nFor help, run ./$0 -h" >&2
 			exit 1
+			;;
+	esac
+done
+
+# Parse long options (not supported by getopts)
+while [[ $# -gt 0 ]] ; do
+	case "$1" in
+		--pgn)
+			pgnFile="$2"
+			shift 2
+			;;
+		--replay)
+			replayFile="$2"
+			shift 2
+			;;
+		--replay-speed)
+			replaySpeed="$2"
+			shift 2
+			;;
+		*)
+			shift
 			;;
 	esac
 done
@@ -656,20 +689,24 @@ declare -A field
 # board start position
 # initialize setting - first row
 declare -a initline=( 4  2  3  5  6  3  2  4 )
-for (( x=0; x<8; x++ )) ; do
-	# set pieces at row 1
-	field[0,$x]=${initline[$x]}
-	# set pawns at row 2
-	field[1,$x]=1
-  # set empty squares from row 3 up to row 6
-	for (( y=2; y<6; y++ )) ; do
-		field[$y,$x]=0
+function initBoard() {
+	local x y
+	for (( x=0; x<8; x++ )) ; do
+		# set pieces at row 1
+		field[0,$x]=${initline[$x]}
+		# set pawns at row 2
+		field[1,$x]=1
+		# set empty squares from row 3 up to row 6
+		for (( y=2; y<6; y++ )) ; do
+			field[$y,$x]=0
+		done
+		# set pawns at row 7
+		field[6,$x]=-1
+		# set pieces at row 8
+		field[7,$x]=$(( (-1) * ${initline[$x]} ))
 	done
-	# set pawns at row 7
-  field[6,$x]=-1
-	# set pieces at row 8
-	field[7,$x]=$(( (-1) * ${initline[$x]} ))
-done
+}
+initBoard
 
 # readable figure names
 declare -a figNames=( "(empty)" "pawn" "knight" "bishop" "rook" "queen" "king" )
@@ -746,6 +783,309 @@ function nameFigure() {
 	else
 		echo -n "${figNames[$1]}"
 	fi
+}
+
+# Get SAN piece letter from piece value
+# Params:
+#	$1	piece value (±1..±6)
+# Outputs single uppercase letter (empty for pawn)
+function pieceLetter() {
+	local v=$(( $1 < 0 ? -$1 : $1 ))
+	case $v in
+		6) echo -n "K" ;; 5) echo -n "Q" ;; 4) echo -n "R" ;;
+		3) echo -n "B" ;; 2) echo -n "N" ;; *) ;;
+	esac
+}
+
+# Generate Standard Algebraic Notation for a move
+# Params:
+#	$1	fromY  $2	fromX  $3	toY  $4	toX  $5	player
+# Outputs SAN string to stdout
+function generateSAN() {
+	local fromY=$1 fromX=$2 toY=$3 toX=$4 player=$5
+	local piece=${field[$fromY,$fromX]}
+	local target=${field[$toY,$toX]}
+	local absPiece=$(( piece < 0 ? -piece : piece ))
+	local san=""
+
+	# Piece letter (empty for pawn)
+	san+="$(pieceLetter "$piece")"
+
+	# Disambiguation (skip for pawns and kings)
+	if (( absPiece != 1 && absPiece != 6 )) ; then
+		local dc=0 sameFile=0 sameRank=0
+		local yy xx pp absPp
+		for (( yy=0; yy<8; yy++ )) ; do
+			for (( xx=0; xx<8; xx++ )) ; do
+				(( yy == fromY && xx == fromX )) && continue
+				pp=${field[$yy,$xx]}
+				(( pp * player <= 0 )) && continue
+				absPp=$(( pp < 0 ? -pp : pp ))
+				(( absPp != absPiece )) && continue
+				if canMove "$yy" "$xx" "$toY" "$toX" "$player" 2>/dev/null ; then
+					(( dc++ ))
+					(( xx == fromX )) && sameFile=1
+					(( yy == fromY )) && sameRank=1
+				fi
+			done
+		done
+		if (( dc > 0 )) ; then
+			if (( sameFile && sameRank )) ; then
+				san+="$(printf "\\x$((61 + fromX))")$((8 - fromY))"
+			elif (( sameFile )) ; then
+				san+="$((8 - fromY))"
+			else
+				san+="$(printf "\\x$((61 + fromX))")"
+			fi
+		fi
+	fi
+
+	# Capture detection
+	local isCapture=0
+	(( target != 0 )) && isCapture=1
+
+	# Pawn captures include source file
+	if (( absPiece == 1 && isCapture )) ; then
+		san+="$(printf "\\x$((61 + fromX))")"
+	fi
+
+	(( isCapture )) && san+="x"
+
+	# Destination square
+	san+="$(coord "$toY" "$toX")"
+
+	# Promotion (only queen)
+	if (( absPiece == 1 && (toY == 0 || toY == 7) )) ; then
+		san+="=Q"
+	fi
+
+	echo -n "$san"
+}
+
+# --- PGN Recording Functions ---
+
+# Write PGN headers to file
+# Uses globals: pgnFile, namePlayerA, namePlayerB
+function writePgnHeaders() {
+	[[ -z "$pgnFile" ]] && return
+	local d
+	d=$(date +%Y.%m.%d)
+	{
+		echo "[Event \"Casual Game\"]"
+		echo "[Site \"Terminal\"]"
+		echo "[Date \"$d\"]"
+		echo "[White \"$namePlayerA\"]"
+		echo "[Black \"$namePlayerB\"]"
+		echo "[Result \"*\"]"
+		echo ""
+	} > "$pgnFile" 2>/dev/null || warn "PGN: cannot write headers to $pgnFile"
+}
+
+# Record a single move in PGN file
+# Params:
+#	$1	SAN notation string
+#	$2	player (negative=White, positive=Black)
+function recordPgnMove() {
+	local san=$1 player=$2
+	[[ -z "$pgnFile" ]] && return
+	if (( player < 0 )) ; then
+		# White's move - start new move number
+		(( pgnMoveNum++ ))
+		pgnBuffer="$pgnMoveNum. $san"
+	else
+		# Black's move - complete the line and flush
+		pgnBuffer+=" $san"
+		echo "$pgnBuffer" >> "$pgnFile" 2>/dev/null || warn "PGN: cannot append move to $pgnFile"
+		pgnBuffer=""
+	fi
+}
+
+# Write game result to PGN file
+# Params:
+#	$1	result string ("1-0", "0-1", or "*")
+function writePgnResult() {
+	local result=$1
+	[[ -z "$pgnFile" ]] && return
+	if [[ -n "$pgnBuffer" ]] ; then
+		echo "$pgnBuffer $result" >> "$pgnFile" 2>/dev/null
+	else
+		echo "$result" >> "$pgnFile" 2>/dev/null
+	fi
+	sed -i "s/^\[Result \"\*\"\]/[Result \"$result\"]/" "$pgnFile" 2>/dev/null
+}
+
+# --- PGN Replay Functions ---
+
+# Parse a PGN file into headers and moves
+# Params:
+#	$1	PGN file path
+# Globals set: pgnHeaders (assoc array), replayMoves (indexed array)
+declare -A pgnHeaders
+declare -a replayMoves
+function parsePgnFile() {
+	local file=$1
+	if [[ ! -f "$file" ]] ; then
+		echo "PGN file not found: $file" >&2
+		return 1
+	fi
+	pgnHeaders=()
+	replayMoves=()
+	local moveText=""
+	local line
+	while IFS= read -r line ; do
+		[[ -z "$line" ]] && continue
+		if [[ "$line" =~ ^\[([A-Za-z]+)[[:space:]]+\"(.*)\"\]$ ]] ; then
+			pgnHeaders["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+		else
+			moveText+=" $line"
+		fi
+	done < "$file"
+	# Tokenize move text: skip move numbers and results
+	local tokens=($moveText)
+	local token
+	for token in "${tokens[@]}" ; do
+		[[ "$token" =~ ^[0-9]+\.+$ ]] && continue
+		[[ "$token" =~ ^(1-0|0-1|1/2-1/2|\*)$ ]] && continue
+		[[ "$token" == "..." ]] && continue
+		replayMoves+=("$token")
+	done
+	if (( ${#replayMoves[@]} == 0 )) ; then
+		echo "No moves found in PGN file: $file" >&2
+		return 1
+	fi
+	return 0
+}
+
+# Parse SAN notation to set move globals
+# Params:
+#	$1	SAN string
+#	$2	current player
+# Globals set: selectedY, selectedX, selectedNewY, selectedNewX
+# Returns 0 on success, 1 on failure
+function parseSANtoMove() {
+	local san=$1 player=$2
+	# Remove check/mate symbols
+	san="${san%+}"
+	san="${san%#}"
+	# Extract promotion
+	local promotion=""
+	if [[ "$san" =~ =([QRBN])$ ]] ; then
+		promotion="${BASH_REMATCH[1]}"
+		san="${san%=*}"
+	fi
+	# Extract destination (last 2 chars)
+	if (( ${#san} < 2 )) ; then
+		echo "Invalid SAN: $1" >&2
+		return 1
+	fi
+	local destFile destRank toX toY
+	destFile="${san: -2:1}"
+	destRank="${san: -1:1}"
+	san="${san:0:${#san}-2}"
+	# Validate destination
+	if [[ ! "$destFile" =~ ^[a-h]$ ]] || [[ ! "$destRank" =~ ^[1-8]$ ]] ; then
+		echo "Invalid destination in SAN: $1" >&2
+		return 1
+	fi
+	LC_CTYPE=C toX=$(( $(printf '%d' "'$destFile") - 97 ))
+	toY=$(( 8 - destRank ))
+	# Remove capture symbol
+	san="${san%x}"
+	# Extract piece type
+	local pieceType=1  # default pawn
+	if [[ "$san" =~ ^([KQRBN]) ]] ; then
+		case "${BASH_REMATCH[1]}" in
+			K) pieceType=6 ;; Q) pieceType=5 ;; R) pieceType=4 ;;
+			B) pieceType=3 ;; N) pieceType=2 ;;
+		esac
+		san="${san:1}"
+	fi
+	# Remaining text is disambiguation
+	local fromFileHint=-1 fromRankHint=-1
+	if [[ "$san" =~ ([a-h]) ]] ; then
+		LC_CTYPE=C fromFileHint=$(( $(printf '%d' "'${BASH_REMATCH[1]}") - 97 ))
+	fi
+	if [[ "$san" =~ ([1-8]) ]] ; then
+		fromRankHint=$(( 8 - ${BASH_REMATCH[1]} ))
+	fi
+	# Search for matching piece
+	local pieceValue=$(( pieceType * (player > 0 ? 1 : -1) ))
+	local yy xx candidates=()
+	for (( yy=0; yy<8; yy++ )) ; do
+		for (( xx=0; xx<8; xx++ )) ; do
+			(( ${field[$yy,$xx]} != pieceValue )) && continue
+			(( fromFileHint >= 0 && xx != fromFileHint )) && continue
+			(( fromRankHint >= 0 && yy != fromRankHint )) && continue
+			if canMove "$yy" "$xx" "$toY" "$toX" "$player" 2>/dev/null ; then
+				candidates+=("$yy,$xx")
+			fi
+		done
+	done
+	if (( ${#candidates[@]} != 1 )) ; then
+		echo "Ambiguous or invalid move: $1 (found ${#candidates[@]} candidates)" >&2
+		return 1
+	fi
+	IFS=',' read -r selectedY selectedX <<< "${candidates[0]}"
+	selectedNewY=$toY
+	selectedNewX=$toX
+	return 0
+}
+
+# Replay a PGN file in terminal
+# Params:
+#	$1	PGN file path
+function replayMode() {
+	local file=$1
+	parsePgnFile "$file" || exit 1
+	# Re-initialize board
+	initBoard
+	# Display game info
+	local infoTitle="Replay: ${pgnHeaders[White]:-White} vs ${pgnHeaders[Black]:-Black}"
+	local infoDate="${pgnHeaders[Date]:-unknown}"
+	local infoResult="${pgnHeaders[Result]:-*}"
+	local totalMoves=${#replayMoves[@]}
+	# Setup screen
+	if $cursor ; then
+		echo -e "\e7\e[s\e[?47h\e[?25l\e[2J\e[H"
+	fi
+	title="$infoTitle ($infoDate)"
+	message="Press Space/Enter for next move, 'q' to quit"
+	draw
+	local moveIndex=0
+	local player=-1  # White moves first
+	while (( moveIndex < totalMoves )) ; do
+		local san="${replayMoves[$moveIndex]}"
+		if ! parseSANtoMove "$san" "$player" ; then
+			echo -e "\n\e[31mFailed to parse move $((moveIndex + 1)): $san\e[0m" >&2
+			break
+		fi
+		move "$player"
+		local moveNum=$(( moveIndex / 2 + 1 ))
+		if (( player < 0 )) ; then
+			title="$infoTitle - $moveNum. $san"
+		else
+			title="$infoTitle - $moveNum. ... $san"
+		fi
+		message="Move $((moveIndex + 1))/$totalMoves | Space=next, q=quit"
+		draw
+		# Wait for keypress
+		local key=""
+		read -rsn1 key
+		if [[ "$key" == "q" || "$key" == "Q" ]] ; then
+			break
+		fi
+		(( player *= -1 ))
+		(( moveIndex++ ))
+	done
+	title="Replay complete"
+	message="Result: $infoResult | Press any key to exit"
+	draw
+	anyKey
+	# Restore screen
+	if $cursor ; then
+		echo -en "\e[2J\e[?47l\e[?25h\e[u\e8"
+	fi
+	exit 0
 }
 
 # Check win/loose position
@@ -1534,15 +1874,20 @@ function input() {
 						warn "You didn't move..." >&3
 					elif (( ${field[$selectedNewY,$selectedNewX]} * player > 0 )) ; then
 						warn "You cannot kill your own figures!" >&3
-					elif move "$player" ; then
-						title="$(namePlayer "$player") moved the \e[3m$figName\e[0m from $(coord "$selectedY" "$selectedX") to $(coord "$selectedNewY" "$selectedNewX") \e[2m(took him $SECONDS seconds)\e[0m"
-					send "$player" "$selectedNewY" "$selectedNewX"
-						return 0
 					else
-						warn "This move is not allowed!" >&3
+						local san
+						san=$(generateSAN "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player")
+						if move "$player" ; then
+							recordPgnMove "$san" "$player"
+							title="$(namePlayer "$player") moved the \e[3m$figName\e[0m from $(coord "$selectedY" "$selectedX") to $(coord "$selectedNewY" "$selectedNewX") \e[2m(took him $SECONDS seconds)\e[0m"
+							send "$player" "$selectedNewY" "$selectedNewX"
+							return 0
+						else
+							warn "This move is not allowed!" >&3
+						fi
+						# Same position again --> revoke
+						send "$player" "$selectedY" "$selectedX"
 					fi
-					# Same position again --> revoke
-					send "$player" "$selectedY" "$selectedX"
 				fi
 			fi
 		fi
@@ -1570,7 +1915,10 @@ function ai() {
 	draw >&3
 	send "$player" "$selectedY" "$selectedX"
 	sleep "$sleep"
+	local san
+	san=$(generateSAN "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player")
 	if move "$player" ; then
+		recordPgnMove "$san" "$player"
 		message="\e[1m$( namePlayer "$player" )\e[0m moves the \e[3m$figName\e[0m at $(coord "$selectedY" "$selectedX") to $(coord "$selectedNewY" "$selectedNewX")"
 		draw >&3
 		send "$player" "$selectedNewY" "$selectedNewX"
@@ -1652,7 +2000,10 @@ function receive() {
 			break
 		fi
 	done
+	local san
+	san=$(generateSAN "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player")
 	if move $player ; then
+		recordPgnMove "$san" "$player"
 		message="\e[1m$( namePlayer "$player" )\e[0m moves the \e[3m$figName\e[0m at $(coord $selectedY $selectedX) to $(coord $selectedNewY $selectedNewX)"
 		draw >&3
 		sleep "$sleep"
@@ -1742,6 +2093,11 @@ function end() {
 # Exit trap
 trap "end" 0
 
+# PGN replay mode (skip AI/network setup)
+if [[ -n "$replayFile" ]] ; then
+	replayMode "$replayFile"
+fi
+
 # setting up requirements for network
 piper="cat"
 fifopipe="/dev/fd/1"
@@ -1771,6 +2127,11 @@ fi
 title="Welcome to ChessBa.sh"
 if isAI "1" || isAI "-1" ; then
 	title="$title - your room heater tool!"
+fi
+
+# Initialize PGN recording
+if [[ -n "$pgnFile" ]] ; then
+	writePgnHeaders
 fi
 
 # permanent cache: import
@@ -1828,6 +2189,12 @@ fi
 			fi
 		else
 			title="Game Over!"
+			# Write PGN result
+			if (( p < 0 )) ; then
+				writePgnResult "0-1"
+			else
+				writePgnResult "1-0"
+			fi
 			message="\e[1m$(namePlayer $(( p * (-1) )) ) wins the game!\e[1m\n"
 			draw >&3
 			anyKey
