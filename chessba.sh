@@ -64,6 +64,14 @@ labelX=-2
 labelY=9
 type stty >/dev/null 2>&1 && useStty=true || useStty=false
 
+# Castling state tracking (has piece moved from starting square)
+hasMovedKingW=0
+hasMovedRookAW=0
+hasMovedRookHW=0
+hasMovedKingB=0
+hasMovedRookAB=0
+hasMovedRookHB=0
+
 # version build number
 build="0.41"
 
@@ -767,6 +775,174 @@ function hasKing() {
 	return 1
 }
 
+# Check if a square is attacked by a given player
+# Params:
+#	$1	y position of target square
+#	$2	x position of target square
+#	$3	attacking player (1=black, -1=white)
+# Returns status code 0 if square is attacked
+function isAttacked() {
+	local ty=$1
+	local tx=$2
+	local atk=$3
+	local i py px dx dy f fp
+
+	# Pawn attacks
+	if (( atk < 0 )) ; then
+		# White pawns at (ty+1, tx±1) attack diagonally upward (decreasing y)
+		py=$(( ty + 1 ))
+		if (( py >= 0 && py < 8 )) ; then
+			if (( tx - 1 >= 0 && field[$py,$(( tx - 1 ))] == -1 )) ; then return 0 ; fi
+			if (( tx + 1 < 8 && field[$py,$(( tx + 1 ))] == -1 )) ; then return 0 ; fi
+		fi
+	else
+		# Black pawns at (ty-1, tx±1) attack diagonally downward (increasing y)
+		py=$(( ty - 1 ))
+		if (( py >= 0 && py < 8 )) ; then
+			if (( tx - 1 >= 0 && field[$py,$(( tx - 1 ))] == 1 )) ; then return 0 ; fi
+			if (( tx + 1 < 8 && field[$py,$(( tx + 1 ))] == 1 )) ; then return 0 ; fi
+		fi
+	fi
+
+	# Knight attacks
+	for dy in -2 -1 1 2 ; do
+		for dx in -2 -1 1 2 ; do
+			if (( ( dy * dy + dx * dx ) == 5 )) ; then
+				py=$(( ty + dy ))
+				px=$(( tx + dx ))
+				if (( py >= 0 && py < 8 && px >= 0 && px < 8 )) ; then
+					f=${field[$py,$px]}
+					if (( f != 0 )) ; then
+						fp=$(( f < 0 ? -1 : 1 ))
+						if (( fp == atk && ${figValues[$(( f * fp ))]} == 2 )) ; then return 0 ; fi
+					fi
+				fi
+			fi
+		done
+	done
+
+	# King attacks (adjacent squares)
+	for dy in -1 0 1 ; do
+		for dx in -1 0 1 ; do
+			if (( dy != 0 || dx != 0 )) ; then
+				py=$(( ty + dy ))
+				px=$(( tx + dx ))
+				if (( py >= 0 && py < 8 && px >= 0 && px < 8 )) ; then
+					f=${field[$py,$px]}
+					if (( f != 0 )) ; then
+						fp=$(( f < 0 ? -1 : 1 ))
+						if (( fp == atk && ${figValues[$(( f * fp ))]} == 6 )) ; then return 0 ; fi
+					fi
+				fi
+			fi
+		done
+	done
+
+	# Diagonal attacks (bishop/queen)
+	for dy in -1 1 ; do
+		for dx in -1 1 ; do
+			for (( i = 1; i < 8; i++ )) ; do
+				py=$(( ty + dy * i ))
+				px=$(( tx + dx * i ))
+				if (( py < 0 || py >= 8 || px < 0 || px >= 8 )) ; then break ; fi
+				f=${field[$py,$px]}
+				if (( f != 0 )) ; then
+					fp=$(( f < 0 ? -1 : 1 ))
+					if (( fp == atk )) ; then
+						if (( ${figValues[$(( f * fp ))]} == 3 || ${figValues[$(( f * fp ))]} == 5 )) ; then return 0 ; fi
+					fi
+					break
+				fi
+			done
+		done
+	done
+
+	# Straight attacks (rook/queen)
+	for dy in -1 0 1 ; do
+		for dx in -1 0 1 ; do
+			if (( ( dy == 0 ) != ( dx == 0 ) )) ; then
+				for (( i = 1; i < 8; i++ )) ; do
+					py=$(( ty + dy * i ))
+					px=$(( tx + dx * i ))
+					if (( py < 0 || py >= 8 || px < 0 || px >= 8 )) ; then break ; fi
+					f=${field[$py,$px]}
+					if (( f != 0 )) ; then
+						fp=$(( f < 0 ? -1 : 1 ))
+						if (( fp == atk )) ; then
+							if (( ${figValues[$(( f * fp ))]} == 4 || ${figValues[$(( f * fp ))]} == 5 )) ; then return 0 ; fi
+						fi
+						break
+					fi
+				done
+			fi
+		done
+	done
+
+	return 1
+}
+
+# Check if castling is valid
+# Params:
+#	$1	king Y position
+#	$2	king X position
+#	$3	target X position
+#	$4	current player
+# Returns status code 0 if castling is valid
+function canCastle() {
+	local ky=$1
+	local kx=$2
+	local tox=$3
+	local player=$4
+	local opp=$(( -player ))
+	local i rx
+
+	# Check king hasn't moved
+	if (( player < 0 )) ; then
+		(( hasMovedKingW )) && return 1
+	else
+		(( hasMovedKingB )) && return 1
+	fi
+
+	# Determine which rook (short=col 7, long=col 0)
+	if (( tox > kx )) ; then
+		rx=7
+		if (( player < 0 )) ; then (( hasMovedRookHW )) && return 1 ; else (( hasMovedRookHB )) && return 1 ; fi
+	else
+		rx=0
+		if (( player < 0 )) ; then (( hasMovedRookAW )) && return 1 ; else (( hasMovedRookAB )) && return 1 ; fi
+	fi
+
+	# Verify rook is present and correct color
+	if (( ${field[$ky,$rx]} * player != 4 )) ; then
+		return 1
+	fi
+
+	# Check path between king and rook is empty
+	if (( tox > kx )) ; then
+		for (( i = kx + 1; i < rx; i++ )) ; do
+			if (( ${field[$ky,$i]} != 0 )) ; then return 1 ; fi
+		done
+	else
+		for (( i = kx - 1; i > rx; i-- )) ; do
+			if (( ${field[$ky,$i]} != 0 )) ; then return 1 ; fi
+		done
+	fi
+
+	# King must not be in check
+	if isAttacked "$ky" "$kx" "$opp" ; then return 1 ; fi
+
+	# King must not pass through or land on attacked square
+	if (( tox > kx )) ; then
+		if isAttacked "$ky" "$(( kx + 1 ))" "$opp" ; then return 1 ; fi
+		if isAttacked "$ky" "$tox" "$opp" ; then return 1 ; fi
+	else
+		if isAttacked "$ky" "$(( kx - 1 ))" "$opp" ; then return 1 ; fi
+		if isAttacked "$ky" "$tox" "$opp" ; then return 1 ; fi
+	fi
+
+	return 0
+}
+
 # Check validity of a concrete single movement
 # Params:
 #	$1	origin Y position
@@ -837,7 +1013,17 @@ function canMove() {
 		return $(( ! ( ( ( fromY - toY == 2 || fromY - toY == -2) && ( fromX - toX == 1 || fromX - toX == -1 ) ) || ( ( fromY - toY == 1 || fromY - toY == -1) && ( fromX - toX == 2 || fromX - toX == -2 ) ) ) ))
 	# king
 	elif (( fig == 6 )) ; then
-		return $(( !( ( ( fromX - toX ) * ( fromX - toX ) ) <= 1 &&  ( ( fromY - toY ) * ( fromY - toY ) ) <= 1 ) ))
+		# Normal king move (one square)
+		if (( ( ( fromX - toX ) * ( fromX - toX ) ) <= 1 && ( ( fromY - toY ) * ( fromY - toY ) ) <= 1 )) ; then
+			return 0
+		fi
+		# Castling: king moves exactly 2 squares horizontally on same rank
+		if (( fromY == toY && toY == ( player < 0 ? 7 : 0 ) && fromX == 4 && ( toX == 6 || toX == 2 ) )) ; then
+			if canCastle "$fromY" "$fromX" "$toX" "$player" ; then
+				return 0
+			fi
+		fi
+		return 1
 	# invalid figure
 	else
 		error "Invalid figure '$from'!"
@@ -983,6 +1169,30 @@ function negamax() {
 							(( t += 1 ))
 						done
 					done
+					# Add castling targets for AI
+					if (( fromX == 4 && fromY == ( player < 0 ? 7 : 0 ) )) ; then
+						local opp=$((-player))
+						if (( player < 0 ? !hasMovedKingW : !hasMovedKingB )) ; then
+							if (( player < 0 ? !hasMovedRookHW : !hasMovedRookHB )) ; then
+								if (( field[$fromY,5] == 0 && field[$fromY,6] == 0 )) ; then
+									if ! isAttacked "$fromY" "$fromX" "$opp" && ! isAttacked "$fromY" 5 "$opp" && ! isAttacked "$fromY" 6 "$opp" ; then
+										targetY[$t]=$fromY
+										targetX[$t]=6
+										(( t += 1 ))
+									fi
+								fi
+							fi
+							if (( player < 0 ? !hasMovedRookAW : !hasMovedRookAB )) ; then
+								if (( field[$fromY,1] == 0 && field[$fromY,2] == 0 && field[$fromY,3] == 0 )) ; then
+									if ! isAttacked "$fromY" "$fromX" "$opp" && ! isAttacked "$fromY" 3 "$opp" && ! isAttacked "$fromY" 2 "$opp" ; then
+										targetY[$t]=$fromY
+										targetX[$t]=2
+										(( t += 1 ))
+									fi
+								fi
+							fi
+						fi
+					fi
 				else
 					# bishop or queen
 					if (( fig != 4 )) ; then
@@ -1032,17 +1242,39 @@ function negamax() {
 					if (( toY >= 0 && toY < 8 && toX >= 0 && toX < 8 )) &&  canMove "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
 						local oldFrom=${field[$fromY,$fromX]};
 						local oldTo=${field[$toY,$toX]};
+						local oldMKW=$hasMovedKingW oldMRAW=$hasMovedRookAW oldMRHW=$hasMovedRookHW
+						local oldMKB=$hasMovedKingB oldMRAB=$hasMovedRookAB oldMRHB=$hasMovedRookHB
+						local oldRookY=-1 oldRookX=-1 oldRookToY=-1 oldRookToX=-1
 						field[$fromY,$fromX]=0
 						field[$toY,$toX]=$oldFrom
 						# pawn to queen
 						if (( oldFrom == player && toY == ( player > 0 ? 7 : 0 ) )) ;then
 							field["$toY,$toX"]=$(( 5 * player ))
 						fi
+						# castling - move rook
+						if (( ${figValues[$(( oldFrom * player ))]} == 6 && fromY == toY && ( toX - fromX == 2 || fromX - toX == 2 ) )) ; then
+							if (( toX > fromX )) ; then
+								oldRookY=$fromY; oldRookX=7; oldRookToY=$fromY; oldRookToX=5
+							else
+								oldRookY=$fromY; oldRookX=0; oldRookToY=$fromY; oldRookToX=3
+							fi
+							field[$oldRookToY,$oldRookToX]=${field[$oldRookY,$oldRookX]}
+							field[$oldRookY,$oldRookX]=0
+						fi
 						# recursion
 						negamax $(( depth - 1 )) $(( 255 - b )) $(( 255 - a )) $(( player * (-1) )) false
 						local val=$(( 255 - $? ))
+						# undo move
 						field[$fromY,$fromX]=$oldFrom
 						field[$toY,$toX]=$oldTo
+						# undo castling rook
+						if (( oldRookY >= 0 )) ; then
+							field[$oldRookY,$oldRookX]=${field[$oldRookToY,$oldRookToX]}
+							field[$oldRookToY,$oldRookToX]=0
+						fi
+						# restore castling flags
+						hasMovedKingW=$oldMKW; hasMovedRookAW=$oldMRAW; hasMovedRookHW=$oldMRHW
+						hasMovedKingB=$oldMKB; hasMovedRookAB=$oldMRAB; hasMovedRookHB=$oldMRHB
 						if (( val > bestVal )) ; then
 							bestVal=$val
 							if $save ; then
@@ -1089,12 +1321,44 @@ function move() {
 	local player=$1
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
 		local fig=${field[$selectedY,$selectedX]}
+
+		# Handle castling (king moves 2 squares horizontally)
+		if (( ${figValues[$(( fig * player ))]} == 6 && selectedY == selectedNewY && ( selectedNewX - selectedX == 2 || selectedX - selectedNewX == 2 ) )) ; then
+			if (( selectedNewX > selectedX )) ; then
+				# Short castle (kingside): rook h->f
+				field[$selectedY,5]=${field[$selectedY,7]}
+				field[$selectedY,7]=0
+			else
+				# Long castle (queenside): rook a->d
+				field[$selectedY,3]=${field[$selectedY,0]}
+				field[$selectedY,0]=0
+			fi
+		fi
+
+		# Move the piece
 		field[$selectedY,$selectedX]=0
 		field[$selectedNewY,$selectedNewX]=$fig
-		# pawn to queen
+
+		# Pawn promotion
 		if (( fig == player && selectedNewY == ( player > 0 ? 7 : 0 ) )) ; then
 			field[$selectedNewY,$selectedNewX]=$(( 5 * player ))
 		fi
+
+		# Update castling flags - king moved
+		if (( ${figValues[$(( fig * player ))]} == 6 )) ; then
+			if (( player < 0 )) ; then hasMovedKingW=1 ; else hasMovedKingB=1 ; fi
+		fi
+		# Update castling flags - rook moved from starting square
+		if (( selectedY == 0 && selectedX == 0 )) ; then hasMovedRookAB=1 ; fi
+		if (( selectedY == 0 && selectedX == 7 )) ; then hasMovedRookHB=1 ; fi
+		if (( selectedY == 7 && selectedX == 0 )) ; then hasMovedRookAW=1 ; fi
+		if (( selectedY == 7 && selectedX == 7 )) ; then hasMovedRookHW=1 ; fi
+		# Update castling flags - rook captured on starting square
+		if (( selectedNewY == 0 && selectedNewX == 0 )) ; then hasMovedRookAB=1 ; fi
+		if (( selectedNewY == 0 && selectedNewX == 7 )) ; then hasMovedRookHB=1 ; fi
+		if (( selectedNewY == 7 && selectedNewX == 0 )) ; then hasMovedRookAW=1 ; fi
+		if (( selectedNewY == 7 && selectedNewX == 7 )) ; then hasMovedRookHW=1 ; fi
+
 		return 0
 	fi
 	return 1

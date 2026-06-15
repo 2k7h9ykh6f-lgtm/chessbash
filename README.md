@@ -47,7 +47,7 @@ Rules
 -----
 
 For simplicity, there are some cutbacks on the implemented [chess rules](http://en.wikipedia.org/wiki/Rules_of_chess) (yet).
-Besides the basic movement of pieces only the pawn promotion is considered - with the limitation that pawns automatically become queens. So castle and en passant moves are not yet implemented.
+Besides the basic movement of pieces, pawn promotion (with the limitation that pawns automatically become queens) and castling (both short/kingside and long/queenside for white and black) are implemented. En passant is not yet supported.
 
 At the moment no special regard is taken to check/checkmate - the game ends, when one loses his king.
 
