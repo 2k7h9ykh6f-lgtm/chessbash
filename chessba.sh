@@ -60,6 +60,7 @@ originX=7
 hoverX=0
 hoverY=0
 hoverInit=false
+status=""
 labelX=-2
 labelY=9
 type stty >/dev/null 2>&1 && useStty=true || useStty=false
@@ -845,6 +846,107 @@ function canMove() {
 	fi
 }
 
+# Check whether a square is attacked by any piece of a given player.
+# Uses the purely geometric canMove, so the target square is expected to hold
+# the piece whose safety is tested (e.g. the king) - which it always does for
+# the check detection below.
+# Params:
+#	$1	target Y position
+#	$2	target X position
+#	$3	attacking player (-1 or 1)
+# Return status code 0 if the square is attacked, 1 otherwise
+function isAttacked() {
+	local y=$1
+	local x=$2
+	local attacker=$3
+	local ax
+	local ay
+	for (( ay=0; ay<8; ay++ )) ; do
+		for (( ax=0; ax<8; ax++ )) ; do
+			# only consider the attacker's own pieces
+			if (( ${field[$ay,$ax]} * attacker > 0 )) && canMove "$ay" "$ax" "$y" "$x" "$attacker" ; then
+				return 0
+			fi
+		done
+	done
+	return 1
+}
+
+# Check whether the given player's king is currently in check
+# Params:
+#	$1	player
+# Return status code 0 if the player is in check
+function inCheck() {
+	local player=$1
+	local kx
+	local ky
+	for (( ky=0; ky<8; ky++ )) ; do
+		for (( kx=0; kx<8; kx++ )) ; do
+			if (( ${field[$ky,$kx]} * player == 6 )) ; then
+				isAttacked "$ky" "$kx" $(( player * (-1) ))
+				return $?
+			fi
+		done
+	done
+	# no king present: treated as not in check (king loss handled separately)
+	return 1
+}
+
+# Test whether performing a move would leave the moving player's king in check
+# (i.e. whether the move is illegal). The move is simulated and reverted.
+# Params:
+#	$1	origin Y position
+#	$2	origin X position
+#	$3	target Y position
+#	$4	target X position
+#	$5	player
+# Return status code 0 if the move would leave the own king in check (illegal)
+function wouldLeaveKingInCheck() {
+	local fromY=$1
+	local fromX=$2
+	local toY=$3
+	local toX=$4
+	local player=$5
+	local oldFrom=${field[$fromY,$fromX]}
+	local oldTo=${field[$toY,$toX]}
+	field[$fromY,$fromX]=0
+	field[$toY,$toX]=$oldFrom
+	inCheck "$player"
+	local r=$?
+	field[$fromY,$fromX]=$oldFrom
+	field[$toY,$toX]=$oldTo
+	return $r
+}
+
+# Check whether the given player has no fully legal move left
+# (a legal move is geometrically valid and does not leave the own king in check)
+# Params:
+#	$1	player
+# Return status code 0 if the player has NO legal move, 1 if at least one exists
+function hasNoLegalMove() {
+	local player=$1
+	local fromY
+	local fromX
+	local toY
+	local toX
+	for (( fromY=0; fromY<8; fromY++ )) ; do
+		for (( fromX=0; fromX<8; fromX++ )) ; do
+			# only the player's own pieces can move
+			if (( ${field[$fromY,$fromX]} * player <= 0 )) ; then
+				continue
+			fi
+			for (( toY=0; toY<8; toY++ )) ; do
+				for (( toX=0; toX<8; toX++ )) ; do
+					if canMove "$fromY" "$fromX" "$toY" "$toX" "$player" && ! wouldLeaveKingInCheck "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
+						return 1
+					fi
+				done
+			done
+		done
+	done
+	return 0
+}
+
 
 # minimax (game theory) algorithm for evaluate possible movements
 # (the heart of your computer enemy)
@@ -1038,6 +1140,12 @@ function negamax() {
 						if (( oldFrom == player && toY == ( player > 0 ? 7 : 0 ) )) ;then
 							field["$toY,$toX"]=$(( 5 * player ))
 						fi
+						# at the root, never select a move that leaves the own king in check
+						if $save && inCheck "$player" ; then
+							field[$fromY,$fromX]=$oldFrom
+							field[$toY,$toX]=$oldTo
+							continue
+						fi
 						# recursion
 						negamax $(( depth - 1 )) $(( 255 - b )) $(( 255 - a )) $(( player * (-1) )) false
 						local val=$(( 255 - $? ))
@@ -1088,6 +1196,10 @@ function negamax() {
 function move() {
 	local player=$1
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
+		# a move that leaves the own king in check is illegal
+		if wouldLeaveKingInCheck "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
+			return 1
+		fi
 		local fig=${field[$selectedY,$selectedX]}
 		field[$selectedY,$selectedX]=0
 		field[$selectedNewY,$selectedNewX]=$fig
@@ -1316,7 +1428,7 @@ function draw() {
 	local tx
 	$useStty && stty -echo
 	$cursor || echo -e "\e[2J"
-	echo -e "\e[H\e[?25l\e[0m\n\e[K$title\e[0m\n\e[K"
+	echo -e "\e[H\e[?25l\e[0m\n\e[K$title\e[0m   $status\e[0m\e[K\n\e[K"
 	for (( ty=0; ty<10; ty++ )) ; do
 		for (( tx=-2; tx<8; tx++ )) ; do
 			if $cursor ; then
@@ -1538,6 +1650,8 @@ function input() {
 						title="$(namePlayer "$player") moved the \e[3m$figName\e[0m from $(coord "$selectedY" "$selectedX") to $(coord "$selectedNewY" "$selectedNewX") \e[2m(took him $SECONDS seconds)\e[0m"
 					send "$player" "$selectedNewY" "$selectedNewX"
 						return 0
+					elif canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
+						warn "You cannot leave your own king in check!" >&3
 					else
 						warn "This move is not allowed!" >&3
 					fi
@@ -1813,25 +1927,50 @@ fi
 		selectedNewX=-1
 		# switch current player
 		(( p *= (-1) ))
-		# check check (or: if the king is lost)
-		if hasKing "$p" ; then
-			if (( remote == p )) ; then
-				receive < $fifopipe
-			elif isAI "$p" ; then
-				if (( computer-- == 0 )) ; then
-					echo "Stopping - performed all ai steps" >&3
-					exit 0
-				fi
-				ai "$p"
-			else
-				input "$p"
-			fi
-		else
+		# reset the per-turn status indicator (shown next to the board title)
+		status=""
+		# Safety net: under legal play a king can never actually be captured
+		if ! hasKing "$p" ; then
 			title="Game Over!"
-			message="\e[1m$(namePlayer $(( p * (-1) )) ) wins the game!\e[1m\n"
+			message="\e[1m$(namePlayer $(( p * (-1) )) ) wins the game!\e[0m\n"
 			draw >&3
 			anyKey
 			exit 0
+		fi
+		# Determine check / checkmate / stalemate for the player to move
+		if inCheck "$p" ; then
+			if hasNoLegalMove "$p" ; then
+				# in check with no legal move -> checkmate, opponent wins
+				status="\e[1;41m Checkmate \e[0m"
+				title="Checkmate!"
+				message="\e[1m$(namePlayer "$p")\e[0m is checkmated - \e[1m$(namePlayer $(( p * (-1) )) )\e[0m wins the game!\n"
+				draw >&3
+				anyKey
+				exit 0
+			else
+				# in check but able to respond
+				status="\e[1;31mCheck!\e[0m"
+			fi
+		elif hasNoLegalMove "$p" ; then
+			# not in check but no legal move -> stalemate, the game is a draw
+			status="\e[1;43m Stalemate \e[0m"
+			title="Stalemate!"
+			message="\e[1m$(namePlayer "$p")\e[0m has no legal move - the game is a draw (stalemate).\n"
+			draw >&3
+			anyKey
+			exit 0
+		fi
+		# regular turn for the player to move
+		if (( remote == p )) ; then
+			receive < $fifopipe
+		elif isAI "$p" ; then
+			if (( computer-- == 0 )) ; then
+				echo "Stopping - performed all ai steps" >&3
+				exit 0
+			fi
+			ai "$p"
+		else
+			input "$p"
 		fi
 	done | $piper > "$fifopipe"
 
