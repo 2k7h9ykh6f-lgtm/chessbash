@@ -671,6 +671,14 @@ for (( x=0; x<8; x++ )) ; do
 	field[7,$x]=$(( (-1) * ${initline[$x]} ))
 done
 
+# castling rights (1 = the king and the corresponding rook have not moved yet)
+# index: "<player>,<side>" with player -1/1 and side k (king-side) / q (queen-side)
+declare -A castle
+castle["-1,k"]=1
+castle["-1,q"]=1
+castle["1,k"]=1
+castle["1,q"]=1
+
 # readable figure names
 declare -a figNames=( "(empty)" "pawn" "knight" "bishop" "rook" "queen" "king" )
 # ascii figure names (for ascii output)
@@ -846,6 +854,139 @@ function canMove() {
 }
 
 
+# Check if a square is attacked by any figure of a given player
+# Params:
+#	$1	target Y position
+#	$2	target X position
+#	$3	attacking player (-1 or 1)
+# Returns status code 0 if the square is attacked
+function isAttacked() {
+	local ty=$1
+	local tx=$2
+	local byPlayer=$3
+	local py
+	local px
+	local f
+	for (( py=0; py<8; py++ )) ; do
+		for (( px=0; px<8; px++ )) ; do
+			f=$(( ${field[$py,$px]} * byPlayer ))
+			# only consider the attacking player's own figures
+			if (( f <= 0 )) ; then
+				continue
+			fi
+			if (( f == 1 )) ; then
+				# a pawn attacks one step diagonally forward
+				if (( ty - py == byPlayer && ( px - tx == 1 || px - tx == -1 ) )) ; then
+					return 0
+				fi
+			# every other figure: reuse the regular movement geometry
+			elif canMove "$py" "$px" "$ty" "$tx" "$byPlayer" ; then
+				return 0
+			fi
+		done
+	done
+	return 1
+}
+
+# Check whether a castling move is currently allowed
+# Params:
+#	$1	player (-1 or 1)
+#	$2	side: "k" (king-side) or "q" (queen-side)
+# Returns status code 0 if castling is allowed
+function canCastle() {
+	local player=$1
+	local side=$2
+	# the king and the rook must not have moved yet
+	if [[ "${castle[$player,$side]}" != "1" ]] ; then
+		return 1
+	fi
+	local row=$(( player > 0 ? 0 : 7 ))
+	# the king must still sit on its home square
+	if (( ${field[$row,4]} != 6 * player )) ; then
+		return 1
+	fi
+	local enemy=$(( player * (-1) ))
+	if [[ "$side" == "k" ]] ; then
+		# rook present and the squares between king and rook empty
+		if (( ${field[$row,7]} != 4 * player )) ; then
+			return 1
+		fi
+		if (( ${field[$row,5]} != 0 || ${field[$row,6]} != 0 )) ; then
+			return 1
+		fi
+		# king must not be in check and not pass through / land on an attacked square
+		if isAttacked "$row" 4 "$enemy" || isAttacked "$row" 5 "$enemy" || isAttacked "$row" 6 "$enemy" ; then
+			return 1
+		fi
+	else
+		if (( ${field[$row,0]} != 4 * player )) ; then
+			return 1
+		fi
+		if (( ${field[$row,1]} != 0 || ${field[$row,2]} != 0 || ${field[$row,3]} != 0 )) ; then
+			return 1
+		fi
+		if isAttacked "$row" 4 "$enemy" || isAttacked "$row" 3 "$enemy" || isAttacked "$row" 2 "$enemy" ; then
+			return 1
+		fi
+	fi
+	return 0
+}
+
+# Recognise a castling move (king two squares horizontally on its home row)
+# Params:
+#	$1	origin Y	$2	origin X	$3	target Y	$4	target X	$5	player
+# Returns status code 0 if this is a valid castling move (has no side effects)
+function isCastlingMove() {
+	local fromY=$1
+	local fromX=$2
+	local toY=$3
+	local toX=$4
+	local player=$5
+	local row=$(( player > 0 ? 0 : 7 ))
+	if (( fromX == 4 && fromY == row && toY == row && ${field[$row,4]} == 6 * player )) ; then
+		if (( toX == 6 )) ; then
+			canCastle "$player" k && return 0
+		elif (( toX == 2 )) ; then
+			canCastle "$player" q && return 0
+		fi
+	fi
+	return 1
+}
+
+# Update castling rights after a (normal) move was performed
+# Params:
+#	$1	origin Y	$2	origin X	$3	target Y	$4	target X	$5	player
+# (no return value)
+function updateCastleRights() {
+	local fromY=$1
+	local fromX=$2
+	local toY=$3
+	local toX=$4
+	local player=$5
+	local row=$(( player > 0 ? 0 : 7 ))
+	local erow=$(( player > 0 ? 7 : 0 ))
+	local enemy=$(( player * (-1) ))
+	# own king left its home square
+	if (( fromY == row && fromX == 4 )) ; then
+		castle["$player,k"]=0
+		castle["$player,q"]=0
+	fi
+	# own rook left its corner
+	if (( fromY == row && fromX == 7 )) ; then
+		castle["$player,k"]=0
+	fi
+	if (( fromY == row && fromX == 0 )) ; then
+		castle["$player,q"]=0
+	fi
+	# enemy rook captured on its corner
+	if (( toY == erow && toX == 7 )) ; then
+		castle["$enemy,k"]=0
+	fi
+	if (( toY == erow && toX == 0 )) ; then
+		castle["$enemy,q"]=0
+	fi
+}
+
 # minimax (game theory) algorithm for evaluate possible movements
 # (the heart of your computer enemy)
 # currently based on negamax with alpha/beta pruning and transposition tables liked described in
@@ -868,7 +1009,7 @@ function negamax() {
 	# transposition table
 	local aSave=$a
 	local hash
-	hash="$player ${field[*]}"
+	hash="$player ${field[*]} ${castle[-1,k]}${castle[-1,q]}${castle[1,k]}${castle[1,q]}"
 	if ! $save && test "${cacheLookup[$hash]+set}" && (( ${cacheDepth[$hash]} >= depth )) ; then
 		local value=${cacheLookup[$hash]}
 		local flag=${cacheFlag[$hash]}
@@ -983,6 +1124,13 @@ function negamax() {
 							(( t += 1 ))
 						done
 					done
+					# castling destinations (validated later via isCastlingMove)
+					targetY[$t]=$(( fromY ))
+					targetX[$t]=$(( fromX + 2 ))
+					(( t += 1 ))
+					targetY[$t]=$(( fromY ))
+					targetX[$t]=$(( fromX - 2 ))
+					(( t += 1 ))
 				else
 					# bishop or queen
 					if (( fig != 4 )) ; then
@@ -1028,36 +1176,81 @@ function negamax() {
 				for (( j=0; j < t; j++ )) ; do
 					local toY=${targetY[$j]}
 					local toX=${targetX[$j]}
-					# move is valid
-					if (( toY >= 0 && toY < 8 && toX >= 0 && toX < 8 )) &&  canMove "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
-						local oldFrom=${field[$fromY,$fromX]};
-						local oldTo=${field[$toY,$toX]};
+					# skip off-board targets
+					if (( toY < 0 || toY >= 8 || toX < 0 || toX >= 8 )) ; then
+						continue
+					fi
+					# accept regular moves or a valid castling move
+					local isCastle=false
+					if canMove "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
+						:
+					elif isCastlingMove "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
+						isCastle=true
+					else
+						continue
+					fi
+					# remember castling rights to restore them after the recursion
+					local sCAk=${castle[-1,k]}
+					local sCAq=${castle[-1,q]}
+					local sCBk=${castle[1,k]}
+					local sCBq=${castle[1,q]}
+					local oldFrom=${field[$fromY,$fromX]}
+					local oldTo=${field[$toY,$toX]}
+					local rookFromX=0
+					local rookToX=0
+					local oldRook=0
+					if $isCastle ; then
+						if (( toX == 6 )) ; then
+							rookFromX=7
+							rookToX=5
+						else
+							rookFromX=0
+							rookToX=3
+						fi
+						oldRook=${field[$fromY,$rookFromX]}
+						field[$fromY,$fromX]=0
+						field[$toY,$toX]=$oldFrom
+						field[$fromY,$rookFromX]=0
+						field[$fromY,$rookToX]=$(( 4 * player ))
+						castle["$player,k"]=0
+						castle["$player,q"]=0
+					else
 						field[$fromY,$fromX]=0
 						field[$toY,$toX]=$oldFrom
 						# pawn to queen
 						if (( oldFrom == player && toY == ( player > 0 ? 7 : 0 ) )) ;then
 							field["$toY,$toX"]=$(( 5 * player ))
 						fi
-						# recursion
-						negamax $(( depth - 1 )) $(( 255 - b )) $(( 255 - a )) $(( player * (-1) )) false
-						local val=$(( 255 - $? ))
-						field[$fromY,$fromX]=$oldFrom
-						field[$toY,$toX]=$oldTo
-						if (( val > bestVal )) ; then
-							bestVal=$val
-							if $save ; then
-								selectedX=$fromX
-								selectedY=$fromY
-								selectedNewX=$toX
-								selectedNewY=$toY
-							fi
+						updateCastleRights "$fromY" "$fromX" "$toY" "$toX" "$player"
+					fi
+					# recursion
+					negamax $(( depth - 1 )) $(( 255 - b )) $(( 255 - a )) $(( player * (-1) )) false
+					local val=$(( 255 - $? ))
+					# undo the move
+					field[$fromY,$fromX]=$oldFrom
+					field[$toY,$toX]=$oldTo
+					if $isCastle ; then
+						field[$fromY,$rookFromX]=$oldRook
+						field[$fromY,$rookToX]=0
+					fi
+					castle[-1,k]=$sCAk
+					castle[-1,q]=$sCAq
+					castle[1,k]=$sCBk
+					castle[1,q]=$sCBq
+					if (( val > bestVal )) ; then
+						bestVal=$val
+						if $save ; then
+							selectedX=$fromX
+							selectedY=$fromY
+							selectedNewX=$toX
+							selectedNewY=$toY
 						fi
-						if (( val > a )) ; then
-							a=$val
-						fi
-						if (( a >= b )) ; then
-							break 3
-						fi
+					fi
+					if (( val > a )) ; then
+						a=$val
+					fi
+					if (( a >= b )) ; then
+						break 3
 					fi
 				done
 			done
@@ -1087,6 +1280,23 @@ function negamax() {
 # Return status code 0 if movement was successfully performed
 function move() {
 	local player=$1
+	# castling: move the king and the corresponding rook together
+	if isCastlingMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
+		local row=$(( player > 0 ? 0 : 7 ))
+		field[$row,4]=0
+		if (( selectedNewX == 6 )) ; then
+			field[$row,6]=$(( 6 * player ))
+			field[$row,7]=0
+			field[$row,5]=$(( 4 * player ))
+		else
+			field[$row,2]=$(( 6 * player ))
+			field[$row,0]=0
+			field[$row,3]=$(( 4 * player ))
+		fi
+		castle["$player,k"]=0
+		castle["$player,q"]=0
+		return 0
+	fi
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
 		local fig=${field[$selectedY,$selectedX]}
 		field[$selectedY,$selectedX]=0
@@ -1095,6 +1305,8 @@ function move() {
 		if (( fig == player && selectedNewY == ( player > 0 ? 7 : 0 ) )) ; then
 			field[$selectedNewY,$selectedNewX]=$(( 5 * player ))
 		fi
+		# keep castling rights in sync after normal king/rook moves and rook captures
+		updateCastleRights "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player"
 		return 0
 	fi
 	return 1
@@ -1249,7 +1461,7 @@ function drawField(){
 				else
 					echo -en "\e[40;100m"
 				fi
-			elif $color && $colorHelper && canMove "$selectedY" "$selectedX" "$y" "$x" "$selectedPlayer" ; then
+			elif $color && $colorHelper && { canMove "$selectedY" "$selectedX" "$y" "$x" "$selectedPlayer" || isCastlingMove "$selectedY" "$selectedX" "$y" "$x" "$selectedPlayer" ; } ; then
 				if $black ; then
 					if (( selectedPlayer < 0 )) ; then
 						echo -en "\e[4${colorPlayerA};10${colorPlayerA}m"
