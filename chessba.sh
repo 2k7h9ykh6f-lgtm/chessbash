@@ -50,6 +50,16 @@ remote=0
 remoteip=127.0.0.1
 remotedelay=0.1
 remotekeyword="remote"
+# FEN import/export and special-rule state
+fen=""
+exportfen=false
+# player who makes the first move: -1 = white (player A, default), 1 = black (player B)
+fenStartPlayer=-1
+# castling availability, en passant target square, halfmove clock and fullmove number
+castlingRights="KQkq"
+enPassant="-"
+halfmove=0
+fullmove=1
 aikeyword="ai"
 aiPlayerA="Marvin"
 aiPlayerB="R2D2"
@@ -222,6 +232,13 @@ function help {
 	echo -e "    -s \e[2mNUMBER\e[0m  Strength of computer (Default: \e[2m$strength\e[0m)"
 	echo -e "    -w \e[2mNUMBER\e[0m  Waiting time for messages in seconds (Default: \e[2m$sleep\e[0m)"
 	echo
+	echo -e "\e[4mStarting position (FEN)\e[0m"
+	echo -e "    --fen \e[2mSTRING\e[0m     Start the game from the given FEN position. The string holds"
+	echo -e "                   placement, active color, castling, en passant target, halfmove"
+	echo -e "                   and fullmove, e.g."
+	echo -e "                   \e[2m\"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\"\e[0m"
+	echo "    --export-fen   Print the FEN of the (starting) position and exit"
+	echo
 	echo -e "\e[4mNetwork settings for remote gaming\e[0m"
 	echo -e "    -P \e[2mNUMBER\e[0m  Set port for network connection (Default: \e[2m$port\e[0m)"
 	echo -e "\e[1;33mAttention:\e[0;33m On a network game the person controlling the first player / A"
@@ -255,7 +272,7 @@ function help {
 }
 
 # Parse command line arguments
-while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz" options; do
+while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz-:" options; do
 	case $options in
 		a )	if [[ -z "$OPTARG" ]] ; then
 				echo "No valid name for first player specified!" >&2
@@ -356,12 +373,213 @@ while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz" options; do
 		h )	help
 			exit 0
 			;;
+		- )	# long options: --fen STRING, --fen=STRING, --export-fen
+			case "$OPTARG" in
+				fen )
+					if (( OPTIND > $# )) ; then
+						echo "Option --fen requires a FEN string argument!" >&2
+						exit 1
+					fi
+					fen="${!OPTIND}"
+					OPTIND=$(( OPTIND + 1 ))
+					;;
+				fen=* )
+					fen="${OPTARG#*=}"
+					;;
+				export-fen )
+					exportfen=true
+					;;
+				export-fen=* )
+					echo "Option --export-fen does not take an argument!" >&2
+					exit 1
+					;;
+				* )
+					echo -e "Invalid option: --$OPTARG\nFor help, run ./$0 -h" >&2
+					exit 1
+					;;
+			esac
+			;;
 		\?)
 			echo -e "Invalid option: -$OPTARG\nFor help, run ./$0 -h" >&2
 			exit 1
 			;;
 	esac
 done
+
+# Print a FEN parsing error and abort.
+# Uses plain stderr because this runs before any screen setup.
+# Params:
+#	$1	message
+function fenError() {
+	echo "Invalid FEN: $1" >&2
+	echo "Expected: <placement> <active> <castling> <enpassant> [halfmove] [fullmove]" >&2
+	echo "Example:  rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" >&2
+	exit 1
+}
+
+# Initialize the board and game state from a FEN string.
+# Piece mapping follows this game's convention: white pieces (FEN uppercase) are
+# player A and stored as negative values, black pieces (FEN lowercase) are player B
+# and stored as positive values. FEN rank 8 maps to board row y=0 (rank 1 to y=7),
+# file a maps to column x=0 (file h to x=7).
+# Params:
+#	$1	FEN string
+# Sets globals: field[], fenStartPlayer, castlingRights, enPassant, halfmove, fullmove
+# Aborts with a clear error on any malformed field.
+function parseFen() {
+	local fenstr="$1"
+	local -a parts
+	IFS=$' \t' read -r -a parts <<< "$fenstr"
+	if (( ${#parts[@]} < 4 )) ; then
+		fenError "expected at least 4 fields but got ${#parts[@]}"
+	fi
+	local placement="${parts[0]}"
+	local active="${parts[1]}"
+	local castling="${parts[2]}"
+	local enpassant="${parts[3]}"
+	local half="${parts[4]:-0}"
+	local full="${parts[5]:-1}"
+
+	# piece placement: exactly 8 ranks separated by '/'
+	local -a ranks
+	IFS='/' read -r -a ranks <<< "$placement"
+	if (( ${#ranks[@]} != 8 )) ; then
+		fenError "piece placement must have 8 ranks separated by '/' (got ${#ranks[@]})"
+	fi
+	local y x i c n sign code rank lastWasDigit
+	local whiteKings=0 blackKings=0
+	for (( y=0; y<8; y++ )) ; do
+		rank="${ranks[$y]}"
+		x=0
+		lastWasDigit=false
+		for (( i=0; i<${#rank}; i++ )) ; do
+			c="${rank:$i:1}"
+			if [[ "$c" =~ ^[1-8]$ ]] ; then
+				if $lastWasDigit ; then
+					fenError "rank $(( 8 - y )) '$rank' has consecutive digits"
+				fi
+				lastWasDigit=true
+				for (( n=0; n<c; n++ )) ; do
+					if (( x > 7 )) ; then
+						fenError "rank $(( 8 - y )) '$rank' describes more than 8 squares"
+					fi
+					field[$y,$x]=0
+					(( x++ ))
+				done
+			elif [[ "$c" =~ ^[PNBRQKpnbrqk]$ ]] ; then
+				lastWasDigit=false
+				if (( x > 7 )) ; then
+					fenError "rank $(( 8 - y )) '$rank' describes more than 8 squares"
+				fi
+				# uppercase = white = player A (negative); lowercase = black = player B (positive)
+				if [[ "$c" =~ ^[PNBRQK]$ ]] ; then
+					sign=-1
+				else
+					sign=1
+				fi
+				case "${c^^}" in
+					P ) code=1 ;;
+					N ) code=2 ;;
+					B ) code=3 ;;
+					R ) code=4 ;;
+					Q ) code=5 ;;
+					K ) code=6
+						if (( sign < 0 )) ; then (( whiteKings++ )) ; else (( blackKings++ )) ; fi
+						;;
+				esac
+				field[$y,$x]=$(( sign * code ))
+				(( x++ ))
+			else
+				fenError "unexpected character '$c' in piece placement"
+			fi
+		done
+		if (( x != 8 )) ; then
+			fenError "rank $(( 8 - y )) '$rank' describes $x squares (expected 8)"
+		fi
+	done
+	if (( whiteKings != 1 || blackKings != 1 )) ; then
+		fenError "each side must have exactly one king (found white=$whiteKings, black=$blackKings)"
+	fi
+
+	# active color: who moves first
+	case "$active" in
+		w | W ) fenStartPlayer=-1 ;;
+		b | B ) fenStartPlayer=1 ;;
+		* ) fenError "active color must be 'w' or 'b' (got '$active')" ;;
+	esac
+
+	# castling availability
+	if [[ "$castling" == "-" || "$castling" =~ ^[KQkq]+$ ]] ; then
+		castlingRights="$castling"
+	else
+		fenError "castling must be '-' or a combination of K, Q, k, q (got '$castling')"
+	fi
+
+	# en passant target square (only valid on rank 3 or 6)
+	if [[ "$enpassant" == "-" || "$enpassant" =~ ^[a-h][36]$ ]] ; then
+		enPassant="$enpassant"
+	else
+		fenError "en passant target must be '-' or a square on rank 3 or 6 (got '$enpassant')"
+	fi
+
+	# halfmove clock
+	if validNumber "$half" ; then
+		halfmove="$half"
+	else
+		fenError "halfmove clock must be a non-negative integer (got '$half')"
+	fi
+
+	# fullmove number
+	if validNumber "$full" && (( full >= 1 )) ; then
+		fullmove="$full"
+	else
+		fenError "fullmove number must be a positive integer (got '$full')"
+	fi
+}
+
+# Serialize the current board and game state into a FEN string (written to stdout).
+# Inverse of parseFen: negative values (player A / white) become uppercase letters,
+# positive values (player B / black) become lowercase.
+# (no params)
+function exportFen() {
+	local out=""
+	local y x f empty abs letter
+	local letters=( "" "P" "N" "B" "R" "Q" "K" )
+	for (( y=0; y<8; y++ )) ; do
+		empty=0
+		for (( x=0; x<8; x++ )) ; do
+			f=${field[$y,$x]}
+			if (( f == 0 )) ; then
+				(( empty++ ))
+			else
+				if (( empty > 0 )) ; then
+					out+="$empty"
+					empty=0
+				fi
+				abs=$(( f < 0 ? -f : f ))
+				letter="${letters[$abs]}"
+				if (( f > 0 )) ; then
+					out+="${letter,,}"
+				else
+					out+="$letter"
+				fi
+			fi
+		done
+		if (( empty > 0 )) ; then
+			out+="$empty"
+		fi
+		if (( y < 7 )) ; then
+			out+="/"
+		fi
+	done
+	local active
+	if (( fenStartPlayer < 0 )) ; then
+		active="w"
+	else
+		active="b"
+	fi
+	echo "$out $active $castlingRights $enPassant $halfmove $fullmove"
+}
 
 # get terminal dimension
 echo -en '\e[18t'
@@ -630,11 +848,6 @@ if $guiconfig ; then
 	dlgconfig
 fi
 
-# Save screen
-if $cursor ; then
-	echo -e "\e7\e[s\e[?47h\e[?25l\e[2J\e[H"
-fi
-
 # lookup tables
 declare -A cacheLookup
 declare -A cacheFlag
@@ -670,6 +883,24 @@ for (( x=0; x<8; x++ )) ; do
 	# set pieces at row 8
 	field[7,$x]=$(( (-1) * ${initline[$x]} ))
 done
+
+# Override the standard opening with a FEN position, if --fen was given
+if [[ -n "$fen" ]] ; then
+	parseFen "$fen"
+fi
+
+# Print the (starting) position as FEN and exit, if --export-fen was given
+if $exportfen ; then
+	# start on a fresh line so the FEN is the last (clean) line of output
+	echo
+	exportFen
+	exit 0
+fi
+
+# Save screen
+if $cursor ; then
+	echo -e "\e7\e[s\e[?47h\e[?25l\e[2J\e[H"
+fi
 
 # readable figure names
 declare -a figNames=( "(empty)" "pawn" "knight" "bishop" "rook" "queen" "king" )
@@ -1786,7 +2017,8 @@ fi
 
 # main game loop
 {
-	p=1
+	# first move goes to the FEN active color (white/player A by default)
+	p=$(( fenStartPlayer * -1 ))
 	while true ; do
 		# initialize remote connection on first run
 		if ! $initializedGameLoop ; then
