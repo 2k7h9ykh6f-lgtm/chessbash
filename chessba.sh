@@ -46,6 +46,11 @@ selectedX=-1
 selectedY=-1
 selectedNewX=-1
 selectedNewY=-1
+# en passant target: the square a pawn just skipped over on a double step
+# (the square an enemy pawn may capture into on the very next move).
+# -1 means no en passant capture is currently available.
+enPassantY=-1
+enPassantX=-1
 remote=0
 remoteip=127.0.0.1
 remotedelay=0.1
@@ -796,7 +801,16 @@ function canMove() {
 		if (( fromX == toX && to == 0 && ( toY - fromY == player || ( toY - fromY == 2 * player && ${field["$((player + fromY)),$fromX"]} == 0 && fromY == ( player > 0 ? 1 : 6 ) ) ) )) ; then
 				return 0
 			else
-				return $(( ! ( (fromX - toX) * (fromX - toX) == 1 && toY - fromY == player && to * player < 0 ) ))
+				# normal diagonal capture of an enemy piece
+				if (( (fromX - toX) * (fromX - toX) == 1 && toY - fromY == player && to * player < 0 )) ; then
+					return 0
+				# en passant: diagonal step onto the recorded skipped-over square (which is empty),
+				# capturing the enemy pawn that just made a two-square advance beside us
+				elif (( (fromX - toX) * (fromX - toX) == 1 && toY - fromY == player && to == 0 && toY == enPassantY && toX == enPassantX && ${field[$fromY,$toX]} * player == -1 )) ; then
+					return 0
+				else
+					return 1
+				fi
 		fi
 	# queen, rook and bishop
 	elif (( fig == 5 || fig == 4  || fig == 3 )) ; then
@@ -868,7 +882,7 @@ function negamax() {
 	# transposition table
 	local aSave=$a
 	local hash
-	hash="$player ${field[*]}"
+	hash="$player $enPassantY $enPassantX ${field[*]}"
 	if ! $save && test "${cacheLookup[$hash]+set}" && (( ${cacheDepth[$hash]} >= depth )) ; then
 		local value=${cacheLookup[$hash]}
 		local flag=${cacheFlag[$hash]}
@@ -938,6 +952,10 @@ function negamax() {
 		local toX
 		local i
 		local j
+		# remember this node's en passant target so it can be restored after each
+		# trial move (recursion overwrites the globals to describe the child position)
+		local savedEpY=$enPassantY
+		local savedEpX=$enPassantX
 		for (( fromY=0; fromY<8; fromY++ )) ; do
 			for (( fromX=0; fromX<8; fromX++ )) ; do
 				local fig=$(( ${field[$fromY,$fromX]} * ( player ) ))
@@ -1032,17 +1050,40 @@ function negamax() {
 					if (( toY >= 0 && toY < 8 && toX >= 0 && toX < 8 )) &&  canMove "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
 						local oldFrom=${field[$fromY,$fromX]};
 						local oldTo=${field[$toY,$toX]};
+						# en passant capture in search: a pawn moving diagonally onto the
+						# (empty) saved en passant square removes the enemy pawn beside it
+						local epCaptured=0
+						local epPiece=0
+						if (( oldFrom == player && oldTo == 0 && toX != fromX && toY == savedEpY && toX == savedEpX )) ; then
+							epPiece=${field[$fromY,$toX]}
+							field[$fromY,$toX]=0
+							epCaptured=1
+						fi
 						field[$fromY,$fromX]=0
 						field[$toY,$toX]=$oldFrom
 						# pawn to queen
 						if (( oldFrom == player && toY == ( player > 0 ? 7 : 0 ) )) ;then
 							field["$toY,$toX"]=$(( 5 * player ))
 						fi
+						# en passant square offered to the child: only on a pawn two-square advance
+						if (( oldFrom == player && (toY - fromY) == 2 * player )) ; then
+							enPassantY=$(( fromY + player ))
+							enPassantX=$fromX
+						else
+							enPassantY=-1
+							enPassantX=-1
+						fi
 						# recursion
 						negamax $(( depth - 1 )) $(( 255 - b )) $(( 255 - a )) $(( player * (-1) )) false
 						local val=$(( 255 - $? ))
+						# restore board and this node's en passant target
+						enPassantY=$savedEpY
+						enPassantX=$savedEpX
 						field[$fromY,$fromX]=$oldFrom
 						field[$toY,$toX]=$oldTo
+						if (( epCaptured == 1 )) ; then
+							field[$fromY,$toX]=$epPiece
+						fi
 						if (( val > bestVal )) ; then
 							bestVal=$val
 							if $save ; then
@@ -1089,11 +1130,26 @@ function move() {
 	local player=$1
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
 		local fig=${field[$selectedY,$selectedX]}
+		# en passant capture: a pawn stepping diagonally onto the (empty) skipped-over
+		# square removes the enemy pawn that sits beside this pawn's origin square
+		if (( fig == player && selectedNewX != selectedX && ${field[$selectedNewY,$selectedNewX]} == 0 && selectedNewY == enPassantY && selectedNewX == enPassantX )) ; then
+			field[$selectedY,$selectedNewX]=0
+		fi
 		field[$selectedY,$selectedX]=0
 		field[$selectedNewY,$selectedNewX]=$fig
 		# pawn to queen
 		if (( fig == player && selectedNewY == ( player > 0 ? 7 : 0 ) )) ; then
 			field[$selectedNewY,$selectedNewX]=$(( 5 * player ))
+		fi
+		# record/clear the en passant target for the opponent's next move:
+		# set it only when this move is a pawn two-square advance, otherwise any
+		# previously available en passant right expires immediately
+		if (( fig == player && (selectedNewY - selectedY) == 2 * player )) ; then
+			enPassantY=$(( selectedY + player ))
+			enPassantX=$selectedX
+		else
+			enPassantY=-1
+			enPassantX=-1
 		fi
 		return 0
 	fi
