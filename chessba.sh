@@ -46,6 +46,7 @@ selectedX=-1
 selectedY=-1
 selectedNewX=-1
 selectedNewY=-1
+enPassantCol=-1
 remote=0
 remoteip=127.0.0.1
 remotedelay=0.1
@@ -796,7 +797,7 @@ function canMove() {
 		if (( fromX == toX && to == 0 && ( toY - fromY == player || ( toY - fromY == 2 * player && ${field["$((player + fromY)),$fromX"]} == 0 && fromY == ( player > 0 ? 1 : 6 ) ) ) )) ; then
 				return 0
 			else
-				return $(( ! ( (fromX - toX) * (fromX - toX) == 1 && toY - fromY == player && to * player < 0 ) ))
+				return $(( ! ( (fromX - toX) * (fromX - toX) == 1 && toY - fromY == player && ( to * player < 0 || ( enPassantCol == toX && fromY == ( player > 0 ? 3 : 4 ) ) ) ) ))
 		fi
 	# queen, rook and bishop
 	elif (( fig == 5 || fig == 4  || fig == 3 )) ; then
@@ -868,7 +869,7 @@ function negamax() {
 	# transposition table
 	local aSave=$a
 	local hash
-	hash="$player ${field[*]}"
+	hash="$player $enPassantCol ${field[*]}"
 	if ! $save && test "${cacheLookup[$hash]+set}" && (( ${cacheDepth[$hash]} >= depth )) ; then
 		local value=${cacheLookup[$hash]}
 		local flag=${cacheFlag[$hash]}
@@ -1032,17 +1033,35 @@ function negamax() {
 					if (( toY >= 0 && toY < 8 && toX >= 0 && toX < 8 )) &&  canMove "$fromY" "$fromX" "$toY" "$toX" "$player" ; then
 						local oldFrom=${field[$fromY,$fromX]};
 						local oldTo=${field[$toY,$toX]};
+						local ep=0
 						field[$fromY,$fromX]=0
 						field[$toY,$toX]=$oldFrom
+						# en passant capture: remove passed pawn
+						if (( oldFrom == player && toX != fromX && oldTo == 0 )) ; then
+							field[$((toY - player)),$toX]=0
+							ep=1
+						fi
 						# pawn to queen
 						if (( oldFrom == player && toY == ( player > 0 ? 7 : 0 ) )) ;then
 							field["$toY,$toX"]=$(( 5 * player ))
 						fi
+						# save and update en passant state
+						local savedEnPassantCol=$enPassantCol
+						if (( oldFrom == player && (toY - fromY) == 2 * player )) ; then
+							enPassantCol=$toX
+						else
+							enPassantCol=-1
+						fi
 						# recursion
 						negamax $(( depth - 1 )) $(( 255 - b )) $(( 255 - a )) $(( player * (-1) )) false
 						local val=$(( 255 - $? ))
+						# unmake move
 						field[$fromY,$fromX]=$oldFrom
 						field[$toY,$toX]=$oldTo
+						if (( ep == 1 )) ; then
+							field[$((toY - player)),$toX]=$(( -player ))
+						fi
+						enPassantCol=$savedEnPassantCol
 						if (( val > bestVal )) ; then
 							bestVal=$val
 							if $save ; then
@@ -1089,11 +1108,22 @@ function move() {
 	local player=$1
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
 		local fig=${field[$selectedY,$selectedX]}
+		local oldTo=${field[$selectedNewY,$selectedNewX]}
 		field[$selectedY,$selectedX]=0
 		field[$selectedNewY,$selectedNewX]=$fig
+		# en passant capture: remove the passed pawn
+		if (( fig == player && selectedNewX != selectedX && oldTo == 0 )) ; then
+			field[$((selectedNewY - player)),$selectedNewX]=0
+		fi
 		# pawn to queen
 		if (( fig == player && selectedNewY == ( player > 0 ? 7 : 0 ) )) ; then
 			field[$selectedNewY,$selectedNewX]=$(( 5 * player ))
+		fi
+		# track double pawn push for en passant right
+		if (( fig == player && (selectedNewY - selectedY) == 2 * player )) ; then
+			enPassantCol=$selectedNewX
+		else
+			enPassantCol=-1
 		fi
 		return 0
 	fi
