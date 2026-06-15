@@ -49,9 +49,9 @@ Rules
 For simplicity, there are some cutbacks on the implemented [chess rules](http://en.wikipedia.org/wiki/Rules_of_chess) (yet).
 Besides the basic movement of pieces only the pawn promotion is considered - with the limitation that pawns automatically become queens. So castle and en passant moves are not yet implemented.
 
-At the moment no special regard is taken to check/checkmate - the game ends, when one loses his king.
+Check, checkmate and stalemate are fully detected: any move that would leave your own king under attack is rejected as illegal. When a player is in check and has no legal move, the game ends with checkmate. When a player is not in check but has no legal move, the game is drawn by stalemate. The UI displays "Check!", "Checkmate!" or "Stalemate!" accordingly.
 
-These limitations are at the moment mainly based on the lack of an easy incorporation with the input, but might be solved in future releases.
+These remaining limitations are at the moment mainly based on the lack of an easy incorporation with the input, but might be solved in future releases.
 
 
 Tips and Tricks

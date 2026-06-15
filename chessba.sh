@@ -767,15 +767,130 @@ function hasKing() {
 	return 1
 }
 
-# Check validity of a concrete single movement
+# Check if a square is attacked by a given player
+# Params:
+#	$1	row (y) of the square to check
+#	$2	column (x) of the square to check
+#	$3	attacking player (1 or -1)
+# Returns status code 0 if the square is attacked
+function isSquareAttacked() {
+	local ty=$1
+	local tx=$2
+	local by=$3
+	local i j sy sx
+
+	# Pawn attacks: enemy pawns attack diagonally forward from their perspective
+	if (( by > 0 )); then
+		# White pawns attack upward (ty-1 is the row below target from white's POV)
+		if (( ty > 0 )); then
+			if (( tx > 0 && ${field[$((ty-1)),$((tx-1))]} == 1 )); then return 0; fi
+			if (( tx < 7 && ${field[$((ty-1)),$((tx+1))]} == 1 )); then return 0; fi
+		fi
+	else
+		# Black pawns attack downward (ty+1 is the row above target from black's POV)
+		if (( ty < 7 )); then
+			if (( tx > 0 && ${field[$((ty+1)),$((tx-1))]} == -1 )); then return 0; fi
+			if (( tx < 7 && ${field[$((ty+1)),$((tx+1))]} == -1 )); then return 0; fi
+		fi
+	fi
+
+	# Knight attacks: check all 8 L-shaped positions
+	for i in -2 -1 1 2; do
+		for j in -2 -1 1 2; do
+			if (( (i < 0 ? -i : i) + (j < 0 ? -j : j) == 3 )); then
+				sy=$((ty + i))
+				sx=$((tx + j))
+				if (( sy >= 0 && sy < 8 && sx >= 0 && sx < 8 )); then
+					if (( ${field[$sy,$sx]} * by == 2 )); then return 0; fi
+				fi
+			fi
+		done
+	done
+
+	# King attacks: check all 8 adjacent squares
+	for (( i = -1; i <= 1; i++ )); do
+		for (( j = -1; j <= 1; j++ )); do
+			if (( i != 0 || j != 0 )); then
+				sy=$((ty + i))
+				sx=$((tx + j))
+				if (( sy >= 0 && sy < 8 && sx >= 0 && sx < 8 )); then
+					if (( ${field[$sy,$sx]} * by == 6 )); then return 0; fi
+				fi
+			fi
+		done
+	done
+
+	# Sliding pieces: rook/queen on ranks and files
+	for i in 1 -1; do
+		# Vertical scan (along files)
+		for (( sy = ty + i; sy >= 0 && sy < 8; sy += i )); do
+			local f=${field[$sy,$tx]}
+			if (( f != 0 )); then
+				if (( f * by == 4 || f * by == 5 )); then return 0; fi
+				break
+			fi
+		done
+		# Horizontal scan (along ranks)
+		for (( sx = tx + i; sx >= 0 && sx < 8; sx += i )); do
+			local f=${field[$ty,$sx]}
+			if (( f != 0 )); then
+				if (( f * by == 4 || f * by == 5 )); then return 0; fi
+				break
+			fi
+		done
+	done
+
+	# Sliding pieces: bishop/queen on diagonals
+	for i in 1 -1; do
+		for j in 1 -1; do
+			sy=$((ty + i))
+			sx=$((tx + j))
+			while (( sy >= 0 && sy < 8 && sx >= 0 && sx < 8 )); do
+				local f=${field[$sy,$sx]}
+				if (( f != 0 )); then
+					if (( f * by == 3 || f * by == 5 )); then return 0; fi
+					break
+				fi
+				sy=$((sy + i))
+				sx=$((sx + j))
+			done
+		done
+	done
+
+	return 1
+}
+
+# Check if a player's king is in check
+# Params:
+#	$1	player whose king to check (1 or -1)
+# Returns status code 0 if the king is in check
+function isChecked() {
+	local player=$1
+	local ky=-1 kx=-1 y x
+	for (( y = 0; y < 8; y++ )); do
+		for (( x = 0; x < 8; x++ )); do
+			if (( ${field[$y,$x]} * player == 6 )); then
+				ky=$y
+				kx=$x
+				break 2
+			fi
+		done
+	done
+	if (( ky < 0 )); then
+		return 1
+	fi
+	isSquareAttacked "$ky" "$kx" $(( player * -1 ))
+}
+
+# Check validity of piece movement rules only (no check test)
 # Params:
 #	$1	origin Y position
 #	$2	origin X position
 #	$3	target Y position
 #	$4	target X position
 #	$5	current player
-# Returns status code 0 if move is valid
-function canMove() {
+# Returns status code 0 if piece movement is valid
+function pieceCanMove() {
 	local fromY=$1
 	local fromX=$2
 	local toY=$3
@@ -845,6 +960,58 @@ function canMove() {
 	fi
 }
 
+# Check validity of a move including check test
+# (a move is illegal if it leaves own king in check)
+# Params:
+#	$1	origin Y position
+#	$2	origin X position
+#	$3	target Y position
+#	$4	target X position
+#	$5	current player
+# Returns status code 0 if move is fully legal
+function canMove() {
+	pieceCanMove "$1" "$2" "$3" "$4" "$5" || return 1
+	local fromY=$1 fromX=$2 toY=$3 toX=$4 player=$5
+	local oldFrom=${field[$fromY,$fromX]}
+	local oldTo=${field[$toY,$toX]}
+	field[$fromY,$fromX]=0
+	field[$toY,$toX]=$oldFrom
+	# handle pawn promotion for accurate check test
+	if (( oldFrom == player && toY == ( player > 0 ? 7 : 0 ) )) ; then
+		field[$toY,$toX]=$(( 5 * player ))
+	fi
+	local result=0
+	if isChecked "$player"; then
+		result=1
+	fi
+	field[$fromY,$fromX]=$oldFrom
+	field[$toY,$toX]=$oldTo
+	return $result
+}
+
+# Check if a player has any legal move
+# Params:
+#	$1	player
+# Returns status code 0 if player has at least one legal move
+function hasLegalMove() {
+	local player=$1
+	local fromY fromX toY toX
+	for (( fromY = 0; fromY < 8; fromY++ )); do
+		for (( fromX = 0; fromX < 8; fromX++ )); do
+			if (( ${field[$fromY,$fromX]} * player > 0 )); then
+				for (( toY = 0; toY < 8; toY++ )); do
+					for (( toX = 0; toX < 8; toX++ )); do
+						if canMove "$fromY" "$fromX" "$toY" "$toX" "$player"; then
+							return 0
+						fi
+					done
+				done
+			fi
+		done
+	done
+	return 1
+}
+
 
 # minimax (game theory) algorithm for evaluate possible movements
 # (the heart of your computer enemy)
@@ -883,7 +1050,7 @@ function negamax() {
 			return "$value"
 		fi
 	fi
-	# lost own king?
+	# lost own king? (safety net — should not happen with legal move enforcement)
 	if ! hasKing "$player" ; then
 		cacheLookup[$hash]=$(( strength - depth + 1 ))
 		cacheDepth[$hash]=$depth
@@ -932,6 +1099,7 @@ function negamax() {
 	# calculate best move
 	else
 		local bestVal=0
+		local foundMove=0
 		local fromY
 		local fromX
 		local toY
@@ -968,10 +1136,10 @@ function negamax() {
 						for (( j=-1 ; j<=1 ; j=j+2 )) ; do
 							targetY[$t]=$(( fromY + 1 * i ))
 							targetX[$t]=$(( fromX + 2 * j ))
-							(( t + 1 ))
+							(( t += 1 ))
 							targetY[$t]=$(( fromY + 2 * i ))
 							targetX[$t]=$(( fromX + 1 * j ))
-							(( t + 1 ))
+							(( t += 1 ))
 						done
 					done
 				# king
@@ -1043,6 +1211,7 @@ function negamax() {
 						local val=$(( 255 - $? ))
 						field[$fromY,$fromX]=$oldFrom
 						field[$toY,$toX]=$oldTo
+						foundMove=1
 						if (( val > bestVal )) ; then
 							bestVal=$val
 							if $save ; then
@@ -1062,6 +1231,14 @@ function negamax() {
 				done
 			done
 		done
+		# safety net: if no legal move was generated (hasLegalMove might have missed it)
+		if (( foundMove == 0 )); then
+			if isChecked "$player"; then
+				bestVal=$(( strength - depth + 1 ))
+			else
+				bestVal=127
+			fi
+		fi
 		cacheLookup[$hash]=$bestVal
 		cacheDepth[$hash]=$depth
 		if (( bestVal <= aSave )) ; then
@@ -1508,11 +1685,15 @@ function inputCoord(){
 function input() {
 	local player=$1
 	SECONDS=0
-	message="\e[1m$(namePlayer "$player")\e[0m: Move your figure"
+	message="${checkMsg}\e[1m$(namePlayer "$player")\e[0m: Move your figure"
 	while true ; do
 		selectedY=-1
 		selectedX=-1
-		title="It's $(namePlayer "$player")s turn"
+		if [[ -n "$checkMsg" ]] ; then
+			title="Check! It's $(namePlayer "$player")s turn"
+		else
+			title="It's $(namePlayer "$player")s turn"
+		fi
 		draw >&3
 		if inputCoord ; then
 			selectedY=$inputY
@@ -1559,8 +1740,12 @@ function ai() {
 	local player=$1
 	local val
 	SECONDS=0
-	title="It's $(namePlayer "$player")s turn"
-	message="Computer player \e[1m$(namePlayer "$player")\e[0m is thinking..."
+	if [[ -n "$checkMsg" ]] ; then
+		title="Check! It's $(namePlayer "$player")s turn"
+	else
+		title="It's $(namePlayer "$player")s turn"
+	fi
+	message="${checkMsg}Computer player \e[1m$(namePlayer "$player")\e[0m is thinking..."
 	draw >&3
 	negamax "$strength" 0 255 "$player" true
 	val=$?
@@ -1625,8 +1810,12 @@ function receiveY() {
 function receive() {
 	local player=$remote
 	SECONDS=0
-	title="It's $(namePlayer "$player")s turn"
-	message="Network player \e[1m$(namePlayer "$player")\e[0m is thinking... (or sleeping?)"
+	if [[ -n "$checkMsg" ]] ; then
+		title="Check! It's $(namePlayer "$player")s turn"
+	else
+		title="It's $(namePlayer "$player")s turn"
+	fi
+	message="${checkMsg}Network player \e[1m$(namePlayer "$player")\e[0m is thinking... (or sleeping?)"
 	draw >&3
 	while true ; do
 		receiveY
@@ -1813,25 +2002,34 @@ fi
 		selectedNewX=-1
 		# switch current player
 		(( p *= (-1) ))
-		# check check (or: if the king is lost)
-		if hasKing "$p" ; then
-			if (( remote == p )) ; then
-				receive < $fifopipe
-			elif isAI "$p" ; then
-				if (( computer-- == 0 )) ; then
-					echo "Stopping - performed all ai steps" >&3
-					exit 0
-				fi
-				ai "$p"
+		# check for checkmate or stalemate
+		if ! hasLegalMove "$p" ; then
+			if isChecked "$p" ; then
+				title="Checkmate!"
+				message="\e[1m$(namePlayer $(( p * (-1) )) ) wins the game!\e[1m\n"
 			else
-				input "$p"
+				title="Stalemate!"
+				message="\e[1mDraw — the game is a tie.\e[1m\n"
 			fi
-		else
-			title="Game Over!"
-			message="\e[1m$(namePlayer $(( p * (-1) )) ) wins the game!\e[1m\n"
 			draw >&3
 			anyKey
 			exit 0
+		fi
+		# determine check status for UI
+		checkMsg=""
+		if isChecked "$p" ; then
+			checkMsg="\e[41m\e[1m Check! \e[0m "
+		fi
+		if (( remote == p )) ; then
+			receive < $fifopipe
+		elif isAI "$p" ; then
+			if (( computer-- == 0 )) ; then
+				echo "Stopping - performed all ai steps" >&3
+				exit 0
+			fi
+			ai "$p"
+		else
+			input "$p"
 		fi
 	done | $piper > "$fifopipe"
 
