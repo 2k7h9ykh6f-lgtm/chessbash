@@ -38,6 +38,8 @@ cache=""
 cachecompress=false
 unicodelabels=true
 port=12433
+pgnfile=""
+replayfile=""
 
 # internal values
 timestamp=$( date +%s%N )
@@ -63,6 +65,8 @@ hoverInit=false
 labelX=-2
 labelY=9
 type stty >/dev/null 2>&1 && useStty=true || useStty=false
+pgnPly=0
+pgnHeaderWritten=false
 
 # version build number
 build="0.41"
@@ -232,6 +236,10 @@ function help {
 	echo "    -z         Compress cache file (only to be used with -c, requires gzip)"
 	echo -e "    -t \e[2mSTEPS\e[0m   Exit after STEPS ai turns and print time (for benchmark)"
 	echo
+	echo -e "\e[4mGame recording and replay\e[0m"
+	echo -e "    --pgn \e[2mFILE\e[0m     Append the game in PGN-style notation to FILE"
+	echo -e "    --replay \e[2mFILE\e[0m  Replay a recorded game from FILE (no AI / no network)"
+	echo
 	echo -e "\e[4mOutput control\e[0m"
 	echo "    -h         This help message"
 	echo "    -v         Version information"
@@ -255,8 +263,48 @@ function help {
 }
 
 # Parse command line arguments
-while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz" options; do
+while getopts ":a:A:b:B:c:P:s:t:w:-:dghilmMnpvVz" options; do
 	case $options in
+		- )	# long options (--pgn FILE / --replay FILE, also accepting --pgn=FILE)
+			case "$OPTARG" in
+				pgn )
+					if [[ -n "${!OPTIND}" && "${!OPTIND}" != -* ]] ; then
+						pgnfile="${!OPTIND}"
+						(( OPTIND++ ))
+					else
+						echo "No valid path for PGN file!" >&2
+						exit 1
+					fi
+					;;
+				pgn=* )
+					pgnfile="${OPTARG#*=}"
+					if [[ -z "$pgnfile" ]] ; then
+						echo "No valid path for PGN file!" >&2
+						exit 1
+					fi
+					;;
+				replay )
+					if [[ -n "${!OPTIND}" && "${!OPTIND}" != -* ]] ; then
+						replayfile="${!OPTIND}"
+						(( OPTIND++ ))
+					else
+						echo "No valid path for replay file!" >&2
+						exit 1
+					fi
+					;;
+				replay=* )
+					replayfile="${OPTARG#*=}"
+					if [[ -z "$replayfile" ]] ; then
+						echo "No valid path for replay file!" >&2
+						exit 1
+					fi
+					;;
+				* )
+					echo -e "Invalid option: --$OPTARG\nFor help, run ./$0 -h" >&2
+					exit 1
+					;;
+			esac
+			;;
 		a )	if [[ -z "$OPTARG" ]] ; then
 				echo "No valid name for first player specified!" >&2
 				exit 1
@@ -673,6 +721,8 @@ done
 
 # readable figure names
 declare -a figNames=( "(empty)" "pawn" "knight" "bishop" "rook" "queen" "king" )
+# PGN figure letters (indexed by absolute figure value)
+declare -a pgnLetters=( "" "P" "N" "B" "R" "Q" "K" )
 # ascii figure names (for ascii output)
 declare -a asciiNames=( "k" "q" "r" "b" "n" "p" " " "P" "N" "B" "R" "Q" "K" )
 
@@ -1089,15 +1139,97 @@ function move() {
 	local player=$1
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
 		local fig=${field[$selectedY,$selectedX]}
+		local captured=${field[$selectedNewY,$selectedNewX]}
+		local promoted=false
 		field[$selectedY,$selectedX]=0
 		field[$selectedNewY,$selectedNewX]=$fig
 		# pawn to queen
 		if (( fig == player && selectedNewY == ( player > 0 ? 7 : 0 ) )) ; then
 			field[$selectedNewY,$selectedNewX]=$(( 5 * player ))
+			promoted=true
 		fi
+		pgnRecord "$player" "$fig" "$captured" "$promoted"
 		return 0
 	fi
 	return 1
+}
+
+# Plain (color-free) player name for file output
+# Params:
+#	$1	player
+# Writes name to stdout
+function pgnPlainName() {
+	if (( $1 < 0 )) ; then
+		if isAI "$1" ; then echo -n "$aiPlayerA" ; else echo -n "$namePlayerA" ; fi
+	else
+		if isAI "$1" ; then echo -n "$aiPlayerB" ; else echo -n "$namePlayerB" ; fi
+	fi
+}
+
+# Warn (once) about a PGN write failure and disable further recording
+# (no params / return value)
+function pgnWarn() {
+	echo -e "\e[2mWarning: could not write to PGN file '$pgnfile' - recording disabled.\e[0m" >&2
+	pgnfile=""
+}
+
+# Write the PGN header (tag pairs) once, as soon as player names are known
+# (no params / return value)
+function pgnInit() {
+	[[ -z "$pgnfile" ]] && return 0
+	$pgnHeaderWritten && return 0
+	pgnHeaderWritten=true
+	{
+		echo "[Event \"Chess Bash game\"]"
+		echo "[Site \"${HOSTNAME:-local}\"]"
+		echo "[Date \"$( date +%Y.%m.%d )\"]"
+		echo "[Time \"$( date +%H:%M:%S )\"]"
+		echo "[White \"$( pgnPlainName -1 )\"]"
+		echo "[Black \"$( pgnPlainName 1 )\"]"
+		echo "[Result \"*\"]"
+		echo
+	} >> "$pgnfile" 2>/dev/null || pgnWarn
+}
+
+# Append one half-move to the PGN file in long algebraic notation
+# Params:
+#	$1	player (negative = White / first player)
+#	$2	moved figure (signed, before promotion)
+#	$3	captured figure on the target square (0 = none)
+#	$4	"true" if the move was a pawn promotion
+# Uses globals selectedY/X (from) and selectedNewY/X (to)
+# (no return value; warns and disables recording on write failure)
+function pgnRecord() {
+	[[ -z "$pgnfile" ]] && return 0
+	local player=$1
+	local movedFig=$2
+	local captured=$3
+	local promoted=$4
+	local mag=$(( movedFig < 0 ? -movedFig : movedFig ))
+	local letter=${pgnLetters[$mag]}
+	local sep="-"
+	(( captured != 0 )) && sep="x"
+	local token="${letter}$( coord "$selectedY" "$selectedX" )${sep}$( coord "$selectedNewY" "$selectedNewX" )"
+	[[ "$promoted" == "true" ]] && token="${token}=Q"
+	local out
+	if (( player < 0 )) ; then
+		# White starts a new numbered move pair
+		out="$(( pgnPly / 2 + 1 )). ${token}"
+		(( pgnPly > 0 )) && out=$'\n'"$out"
+	else
+		out=" ${token}"
+	fi
+	(( pgnPly++ ))
+	printf '%s' "$out" >> "$pgnfile" 2>/dev/null || pgnWarn
+}
+
+# Terminate the movetext with the game result token
+# Params:
+#	$1	result string (e.g. "1-0", "0-1", "*")
+# (no return value)
+function pgnFinalize() {
+	[[ -z "$pgnfile" ]] && return 0
+	printf ' %s\n' "$1" >> "$pgnfile" 2>/dev/null || pgnWarn
 }
 
 # Unicode helper function (for draw)
@@ -1742,6 +1874,79 @@ function end() {
 # Exit trap
 trap "end" 0
 
+# Wait for a key during replay; returns 1 if the user pressed 'q' to quit
+# (no params)
+function anyKeyReplay() {
+	$useStty && stty echo
+	local k
+	read -r -sN1 k
+	$useStty && stty -echo
+	[[ "$k" == "q" || "$k" == "Q" ]] && return 1
+	return 0
+}
+
+# Replay a previously recorded game step by step (no AI, no network)
+# Reads $replayfile, applies each recorded half-move to the board and redraws
+# (no params / return value)
+function replay() {
+	if [[ ! -r "$replayfile" ]] ; then
+		error "Cannot read replay file '$replayfile'!"
+	fi
+	# recover player names from the PGN header (best effort)
+	local w b
+	w=$( grep -m1 '^\[White ' "$replayfile" 2>/dev/null | sed -E 's/^\[White "(.*)"\].*/\1/' )
+	b=$( grep -m1 '^\[Black ' "$replayfile" 2>/dev/null | sed -E 's/^\[Black "(.*)"\].*/\1/' )
+	[[ -n "$w" ]] && namePlayerA="$w"
+	[[ -n "$b" ]] && namePlayerB="$b"
+	# extract the half-moves in order (long algebraic), skipping header/result lines
+	local tokens
+	mapfile -t tokens < <( grep -v '^\[' "$replayfile" 2>/dev/null | grep -oE '[PNBRQK]?[a-h][1-8][-x][a-h][1-8](=[QRBN])?' )
+	local total=${#tokens[@]}
+	if (( total == 0 )) ; then
+		error "No moves found in replay file '$replayfile'!"
+	fi
+	# White (first player / negative figures) starts
+	local p=-1
+	local i
+	selectedY=-1 ; selectedX=-1 ; selectedNewY=-1 ; selectedNewX=-1
+	title="Replay: $( namePlayer -1 ) (White) vs $( namePlayer 1 ) (Black)"
+	message="\e[1mReplay mode\e[0m - $total half-moves. Any key = step, 'q' = quit."
+	draw
+	anyKeyReplay || { message="\e[1mReplay aborted.\e[0m" ; draw ; return ; }
+	for (( i=0; i<total; i++ )) ; do
+		local tok=${tokens[$i]}
+		# drop an optional leading piece letter, leaving <from><sep><to>[=Q]
+		[[ "$tok" =~ ^[PNBRQK] ]] && tok=${tok:1}
+		local fy=$(( 8 - ${tok:1:1} ))
+		local fx=$(( $( ord "${tok:0:1}" ) - 97 ))
+		local ty=$(( 8 - ${tok:4:1} ))
+		local tx=$(( $( ord "${tok:3:1}" ) - 97 ))
+		local fig=${field[$fy,$fx]}
+		field[$fy,$fx]=0
+		field[$ty,$tx]=$fig
+		# promotion (recorded with =Q): replace with a queen of the moving side
+		if [[ "${tokens[$i]}" == *"="* ]] ; then
+			field[$ty,$tx]=$(( 5 * p ))
+		fi
+		local figName
+		figName=$( nameFigure "$fig" )
+		title="Move $(( i / 2 + 1 )): $( namePlayer "$p" ) moves the $figName $( coord "$fy" "$fx" )-$( coord "$ty" "$tx" )"
+		message="\e[1mReplay\e[0m [$(( i + 1 ))/$total] - any key = next, 'q' = quit"
+		draw
+		anyKeyReplay || break
+		p=$(( p * (-1) ))
+	done
+	message="\e[1mReplay finished.\e[0m"
+	draw
+	anyKey
+}
+
+# Replay mode short-circuits the game: no AI search, no network connection
+if [[ -n "$replayfile" ]] ; then
+	replay
+	exit 0
+fi
+
 # setting up requirements for network
 piper="cat"
 fifopipe="/dev/fd/1"
@@ -1806,6 +2011,8 @@ fi
 			# set this loop initialized
 			initializedGameLoop=true
 		fi
+		# write the PGN header once player names are known (no-op without --pgn)
+		pgnInit
 		# reset global variables
 		selectedY=-1
 		selectedX=-1
@@ -1820,6 +2027,7 @@ fi
 			elif isAI "$p" ; then
 				if (( computer-- == 0 )) ; then
 					echo "Stopping - performed all ai steps" >&3
+					pgnFinalize "*"
 					exit 0
 				fi
 				ai "$p"
@@ -1829,6 +2037,11 @@ fi
 		else
 			title="Game Over!"
 			message="\e[1m$(namePlayer $(( p * (-1) )) ) wins the game!\e[1m\n"
+			if (( p * (-1) < 0 )) ; then
+				pgnFinalize "1-0"
+			else
+				pgnFinalize "0-1"
+			fi
 			draw >&3
 			anyKey
 			exit 0
