@@ -39,6 +39,20 @@ cachecompress=false
 unicodelabels=true
 port=12433
 
+# FEN (Forsyth-Edwards Notation) state
+fenString=""
+fenCastleWK=false
+fenCastleWQ=false
+fenCastleBK=false
+fenCastleBQ=false
+fenEnPassant="-"
+fenHalfmove=0
+fenFullmove=1
+fenActiveColor="w"
+fenInitialP=1
+fenPlies=0
+exportFen=false
+
 # internal values
 timestamp=$( date +%s%N )
 fifopipeprefix="/tmp/chessbashpipe"
@@ -222,6 +236,12 @@ function help {
 	echo -e "    -s \e[2mNUMBER\e[0m  Strength of computer (Default: \e[2m$strength\e[0m)"
 	echo -e "    -w \e[2mNUMBER\e[0m  Waiting time for messages in seconds (Default: \e[2m$sleep\e[0m)"
 	echo
+	echo -e "\e[4mFEN (Forsyth-Edwards Notation)\e[0m"
+	echo -e "    --fen \e[2mSTRING\e[0m  Initialize the board from a FEN string instead of the"
+	echo "               standard starting position. Sets piece positions, active"
+	echo "               color, castling rights, en passant, halfmove and fullmove."
+	echo "    --export-fen   Print the current FEN on game exit (or press 'f' in-game)."
+	echo
 	echo -e "\e[4mNetwork settings for remote gaming\e[0m"
 	echo -e "    -P \e[2mNUMBER\e[0m  Set port for network connection (Default: \e[2m$port\e[0m)"
 	echo -e "\e[1;33mAttention:\e[0;33m On a network game the person controlling the first player / A"
@@ -255,7 +275,37 @@ function help {
 }
 
 # Parse command line arguments
-while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz" options; do
+# Pre-process long options (getopts only supports short options)
+ARGS=()
+while (( $# > 0 )); do
+	case "$1" in
+		--fen)
+			if [[ -n "${2+x}" ]] ; then
+				ARGS+=("-F" "$2")
+				shift 2
+			else
+				echo "Error: --fen requires a FEN string argument." >&2
+				exit 1
+			fi
+			;;
+		--export-fen)
+			ARGS+=("-E")
+			shift
+			;;
+		--)
+			shift
+			ARGS+=("$@")
+			break
+			;;
+		*)
+			ARGS+=("$1")
+			shift
+			;;
+	esac
+done
+set -- "${ARGS[@]}"
+
+while getopts ":a:A:b:B:c:EF:P:s:t:w:dghilmMnpvVz" options; do
 	case $options in
 		a )	if [[ -z "$OPTARG" ]] ; then
 				echo "No valid name for first player specified!" >&2
@@ -318,6 +368,14 @@ while getopts ":a:A:b:B:c:P:s:t:w:dghilmMnpvVz" options; do
 			else
 				cache="$OPTARG"
 			fi
+			;;
+		F )	if [[ -z "$OPTARG" ]] ; then
+				echo "Error: No FEN string provided for --fen!" >&2
+				exit 1
+			fi
+			fenString="$OPTARG"
+			;;
+		E )	exportFen=true
 			;;
 		t )	if validNumber "$OPTARG" ; then
 				computer=$OPTARG
@@ -688,6 +746,246 @@ declare -a asciiNames=( "k" "q" "r" "b" "n" "p" " " "P" "N" "B" "R" "Q" "K" )
 declare -a figValues=( 0 1 3 3 5 9 42 )
 #declare -a figValues=( 0 100 320 330 500 900 10000 )
 
+# ---- FEN (Forsyth-Edwards Notation) support ----
+
+# FEN piece character to field value mapping
+# In code convention: positive = Player A (top/black), negative = Player B (bottom/white)
+# FEN: uppercase = White (→ negative), lowercase = Black (→ positive)
+declare -A fenPieceMap=( [K]=-6 [Q]=-5 [R]=-4 [B]=-3 [N]=-2 [P]=-1 [k]=6 [q]=5 [r]=4 [b]=3 [n]=2 [p]=1 )
+
+# Parse a FEN string and initialize the board
+# Params:
+#	$1	FEN string
+# Returns 0 on success, 1 on invalid FEN
+function parseFen() {
+	local fen="$1"
+
+	if [[ -z "$fen" ]] ; then
+		echo "Error: Empty FEN string." >&2
+		return 1
+	fi
+
+	# Split FEN into its 6 space-separated fields
+	local -a parts
+	IFS=' ' read -ra parts <<< "$fen"
+	if (( ${#parts[@]} < 1 )) ; then
+		echo "Error: Invalid FEN - missing piece placement." >&2
+		return 1
+	fi
+
+	# --- Field 1: Piece placement (8 ranks separated by '/') ---
+	local -a ranks
+	IFS='/' read -ra ranks <<< "${parts[0]}"
+	if (( ${#ranks[@]} != 8 )) ; then
+		echo "Error: Invalid FEN - expected 8 ranks separated by '/', got ${#ranks[@]}." >&2
+		return 1
+	fi
+
+	# Clear the entire board
+	local cx cy
+	for (( cy=0; cy<8; cy++ )) ; do
+		for (( cx=0; cx<8; cx++ )) ; do
+			field[$cy,$cx]=0
+		done
+	done
+
+	# Parse each rank (FEN rank 8 = row 0, rank 7 = row 1, ..., rank 1 = row 7)
+	local ri ch cv count
+	for (( ri=0; ri<8; ri++ )) ; do
+		local row=$ri
+		local col=0
+		local rank="${ranks[$ri]}"
+		for (( ci=0; ci<${#rank}; ci++ )) ; do
+			ch="${rank:$ci:1}"
+			if [[ "$ch" =~ [1-8] ]] ; then
+				(( col += ch ))
+			elif [[ -n "${fenPieceMap[$ch]+x}" ]] ; then
+				if (( col >= 8 )) ; then
+					echo "Error: Invalid FEN - rank $((8 - ri)) has too many squares." >&2
+					return 1
+				fi
+				field[$row,$col]=${fenPieceMap[$ch]}
+				(( col++ ))
+			else
+				echo "Error: Invalid FEN - unknown piece character '$ch' in rank $((8 - ri))." >&2
+				return 1
+			fi
+		done
+		if (( col != 8 )) ; then
+			echo "Error: Invalid FEN - rank $((8 - ri)) has $col squares instead of 8." >&2
+			return 1
+		fi
+	done
+
+	# Validate: both kings must be present
+	local wKing=0 bKing=0
+	for (( cy=0; cy<8; cy++ )) ; do
+		for (( cx=0; cx<8; cx++ )) ; do
+			(( field[$cy,$cx] == -6 )) && (( wKing++ ))
+			(( field[$cy,$cx] == 6 )) && (( bKing++ ))
+		done
+	done
+	if (( wKing != 1 )) ; then
+		echo "Error: Invalid FEN - white must have exactly 1 king (found $wKing)." >&2
+		return 1
+	fi
+	if (( bKing != 1 )) ; then
+		echo "Error: Invalid FEN - black must have exactly 1 king (found $bKing)." >&2
+		return 1
+	fi
+
+	# --- Field 2: Active color ---
+	fenActiveColor="w"
+	if (( ${#parts[@]} >= 2 )) ; then
+		case "${parts[1]}" in
+			w|b) fenActiveColor="${parts[1]}" ;;
+			*)
+				echo "Error: Invalid FEN - active color must be 'w' or 'b', got '${parts[1]}'." >&2
+				return 1
+				;;
+		esac
+	fi
+
+	# --- Field 3: Castling rights ---
+	fenCastleWK=false; fenCastleWQ=false; fenCastleBK=false; fenCastleBQ=false
+	if (( ${#parts[@]} >= 3 )) ; then
+		local castleStr="${parts[2]}"
+		if [[ "$castleStr" != "-" ]] ; then
+			[[ "$castleStr" == *K* ]] && fenCastleWK=true
+			[[ "$castleStr" == *Q* ]] && fenCastleWQ=true
+			[[ "$castleStr" == *k* ]] && fenCastleBK=true
+			[[ "$castleStr" == *q* ]] && fenCastleBQ=true
+		fi
+	fi
+
+	# --- Field 4: En passant target square ---
+	fenEnPassant="-"
+	if (( ${#parts[@]} >= 4 )) ; then
+		local ep="${parts[3]}"
+		if [[ "$ep" != "-" ]] ; then
+			if [[ ! "$ep" =~ ^[a-h][36]$ ]] ; then
+				echo "Error: Invalid FEN - en passant square '$ep' is not valid (expected a-h + 3 or 6)." >&2
+				return 1
+			fi
+			fenEnPassant="$ep"
+		fi
+	fi
+
+	# --- Field 5: Halfmove clock ---
+	fenHalfmove=0
+	if (( ${#parts[@]} >= 5 )) ; then
+		if [[ "${parts[4]}" =~ ^[0-9]+$ ]] ; then
+			fenHalfmove=${parts[4]}
+		else
+			echo "Error: Invalid FEN - halfmove clock '${parts[4]}' is not a number." >&2
+			return 1
+		fi
+	fi
+
+	# --- Field 6: Fullmove number ---
+	fenFullmove=1
+	if (( ${#parts[@]} >= 6 )) ; then
+		if [[ "${parts[5]}" =~ ^[0-9]+$ ]] && (( ${parts[5]} > 0 )) ; then
+			fenFullmove=${parts[5]}
+		else
+			echo "Error: Invalid FEN - fullmove number '${parts[5]}' is not valid." >&2
+			return 1
+		fi
+	fi
+
+	# Determine who moves first in the game loop
+	# Loop does: p *= -1 at each iteration start
+	# p=1 → Player A (top/black, positive pieces); p=-1 → Player B (bottom/white, negative pieces)
+	# FEN "w" = white (bottom, negative) moves first → need p=-1 after first flip → fenInitialP=1
+	# FEN "b" = black (top, positive) moves first → need p=1 after first flip → fenInitialP=-1
+	if [[ "$fenActiveColor" == "b" ]] ; then
+		fenInitialP=-1
+		fenPlies=1
+	else
+		fenInitialP=1
+		fenPlies=0
+	fi
+
+	fenString="$fen"
+	return 0
+}
+
+# Convert internal (row, col) to algebraic notation for FEN (e.g., row=4,col=4 → "e4")
+function fenCoord() {
+	local row=$1 col=$2
+	printf '%c%d' $(( 97 + col )) $(( 8 - row ))
+}
+
+# Generate FEN string from the current board state
+# Writes FEN to stdout
+function exportFen() {
+	local fen=""
+	local y x
+
+	# --- Field 1: Piece placement ---
+	# Value-to-FEN-char mapping (negative = White uppercase, positive = Black lowercase)
+	local -A valToFen=( [-6]=K [-5]=Q [-4]=R [-3]=B [-2]=N [-1]=P [1]=p [2]=n [3]=b [4]=r [5]=q [6]=k )
+	for (( y=0; y<8; y++ )) ; do
+		if (( y > 0 )) ; then
+			fen+="/"
+		fi
+		local empty=0
+		for (( x=0; x<8; x++ )) ; do
+			local v=${field[$y,$x]}
+			if (( v == 0 )) ; then
+				(( empty++ ))
+			else
+				if (( empty > 0 )) ; then
+					fen+="$empty"
+					empty=0
+				fi
+				fen+="${valToFen[$v]}"
+			fi
+		done
+		if (( empty > 0 )) ; then
+			fen+="$empty"
+		fi
+	done
+
+	# --- Field 2: Active color ---
+	# Determine from total plies played (tracked in fenPlies)
+	local activeColor
+	if (( fenPlies % 2 == 0 )) ; then
+		activeColor="w"
+	else
+		activeColor="b"
+	fi
+	fen+=" $activeColor"
+
+	# --- Field 3: Castling rights ---
+	local castle=""
+	$fenCastleWK && castle+="K"
+	$fenCastleWQ && castle+="Q"
+	$fenCastleBK && castle+="k"
+	$fenCastleBQ && castle+="q"
+	[[ -z "$castle" ]] && castle="-"
+	fen+=" $castle"
+
+	# --- Field 4: En passant target square ---
+	fen+=" $fenEnPassant"
+
+	# --- Field 5: Halfmove clock ---
+	fen+=" $fenHalfmove"
+
+	# --- Field 6: Fullmove number ---
+	local fullmove=$(( fenFullmove + fenPlies / 2 ))
+	fen+=" $fullmove"
+
+	echo "$fen"
+}
+
+# Apply FEN if provided (overrides standard starting position)
+if [[ -n "$fenString" ]] ; then
+	if ! parseFen "$fenString" ; then
+		exit 1
+	fi
+fi
+
 # Warning message on invalid moves (Helper)
 # Params:
 #	$1	message
@@ -793,6 +1091,15 @@ function canMove() {
 		return 1
 	# pawn
 	elif (( fig == 1 )) ; then
+		# en passant capture
+		if [[ "$fenEnPassant" != "-" ]] ; then
+			local epCol=$(( $(printf '%d' "'${fenEnPassant:0:1}") - 97 ))
+			local epRow=$(( 8 - ${fenEnPassant:1:1} ))
+			local epPawnRow=$(( epRow + player ))
+			if (( fromY == epPawnRow && (fromX - toX) * (fromX - toX) == 1 && toY - fromY == player && toX == epCol && to == 0 && field[$fromY,$toX] == -player )) ; then
+				return 0
+			fi
+		fi
 		if (( fromX == toX && to == 0 && ( toY - fromY == player || ( toY - fromY == 2 * player && ${field["$((player + fromY)),$fromX"]} == 0 && fromY == ( player > 0 ? 1 : 6 ) ) ) )) ; then
 				return 0
 			else
@@ -837,7 +1144,30 @@ function canMove() {
 		return $(( ! ( ( ( fromY - toY == 2 || fromY - toY == -2) && ( fromX - toX == 1 || fromX - toX == -1 ) ) || ( ( fromY - toY == 1 || fromY - toY == -1) && ( fromX - toX == 2 || fromX - toX == -2 ) ) ) ))
 	# king
 	elif (( fig == 6 )) ; then
-		return $(( !( ( ( fromX - toX ) * ( fromX - toX ) ) <= 1 &&  ( ( fromY - toY ) * ( fromY - toY ) ) <= 1 ) ))
+		# Normal king move (1 square in any direction)
+		if (( ( ( fromX - toX ) * ( fromX - toX ) ) <= 1 &&  ( ( fromY - toY ) * ( fromY - toY ) ) <= 1 )) ; then
+			return 0
+		fi
+		# Castling: king moves exactly 2 squares horizontally on back rank
+		local kingRow=$(( player < 0 ? 0 : 7 ))
+		if (( fromY == kingRow && fromX == 4 && toY == kingRow && (toX == 6 || toX == 2) )) ; then
+			if (( toX == 6 )) ; then
+				# Kingside castling
+				local canCastle
+				if (( player < 0 )) ; then $fenCastleBK && canCastle=1 || canCastle=0; else $fenCastleWK && canCastle=1 || canCastle=0; fi
+				if (( canCastle && field[$kingRow,4] == 6 * player && field[$kingRow,7] == 4 * player && field[$kingRow,5] == 0 && field[$kingRow,6] == 0 )) ; then
+					return 0
+				fi
+			else
+				# Queenside castling
+				local canCastle
+				if (( player < 0 )) ; then $fenCastleBQ && canCastle=1 || canCastle=0; else $fenCastleWQ && canCastle=1 || canCastle=0; fi
+				if (( canCastle && field[$kingRow,4] == 6 * player && field[$kingRow,0] == 4 * player && field[$kingRow,1] == 0 && field[$kingRow,2] == 0 && field[$kingRow,3] == 0 )) ; then
+					return 0
+				fi
+			fi
+		fi
+		return 1
 	# invalid figure
 	else
 		error "Invalid figure '$from'!"
@@ -1089,9 +1419,81 @@ function move() {
 	local player=$1
 	if canMove "$selectedY" "$selectedX" "$selectedNewY" "$selectedNewX" "$player" ; then
 		local fig=${field[$selectedY,$selectedX]}
+		local captured=${field[$selectedNewY,$selectedNewX]}
+		local isPawnMove=0
+		local isCapture=0
+
+		(( fig * player == 1 )) && isPawnMove=1
+		(( captured != 0 )) && isCapture=1
+
+		# --- Handle castling execution ---
+		if (( fig * player == 6 && (selectedNewX - selectedX) * (selectedNewX - selectedX) == 4 && selectedNewY == selectedY )) ; then
+			local kingRow=$(( player < 0 ? 0 : 7 ))
+			if (( selectedNewX == 6 )) ; then
+				# Kingside: move rook from h to f
+				field[$kingRow,7]=0
+				field[$kingRow,5]=$(( 4 * player ))
+			else
+				# Queenside: move rook from a to d
+				field[$kingRow,0]=0
+				field[$kingRow,3]=$(( 4 * player ))
+			fi
+		fi
+
+		# --- Handle en passant capture execution ---
+		if (( isPawnMove && selectedNewX != selectedX && captured == 0 )) ; then
+			# Diagonal pawn move to empty square = en passant
+			field[$selectedY,$selectedNewX]=0
+			isCapture=1
+		fi
+
+		# Move the piece
 		field[$selectedY,$selectedX]=0
 		field[$selectedNewY,$selectedNewX]=$fig
-		# pawn to queen
+
+		# --- Update en passant target square ---
+		fenEnPassant="-"
+		if (( isPawnMove && (selectedNewY - selectedY) * (selectedNewY - selectedY) == 4 )) ; then
+			# Pawn double push: set en passant target square
+			local epRow=$(( (selectedY + selectedNewY) / 2 ))
+			fenEnPassant="$(fenCoord "$epRow" "$selectedX")"
+		fi
+
+		# --- Update castling rights ---
+		# King moves: lose all castling for that player
+		if (( fig * player == 6 )) ; then
+			if (( player < 0 )) ; then
+				fenCastleBK=false; fenCastleBQ=false
+			else
+				fenCastleWK=false; fenCastleWQ=false
+			fi
+		fi
+		# Rook moves or is captured: lose that side's castling
+		local kingRowA=0 kingRowB=7
+		if (( selectedY == kingRowA && selectedX == 0 )) || (( selectedNewY == kingRowA && selectedNewX == 0 )) ; then
+			fenCastleBQ=false
+		fi
+		if (( selectedY == kingRowA && selectedX == 7 )) || (( selectedNewY == kingRowA && selectedNewX == 7 )) ; then
+			fenCastleBK=false
+		fi
+		if (( selectedY == kingRowB && selectedX == 0 )) || (( selectedNewY == kingRowB && selectedNewX == 0 )) ; then
+			fenCastleWQ=false
+		fi
+		if (( selectedY == kingRowB && selectedX == 7 )) || (( selectedNewY == kingRowB && selectedNewX == 7 )) ; then
+			fenCastleWK=false
+		fi
+
+		# --- Update halfmove clock ---
+		if (( isPawnMove || isCapture )) ; then
+			fenHalfmove=0
+		else
+			(( fenHalfmove++ ))
+		fi
+
+		# --- Track plies for FEN export ---
+		(( fenPlies++ ))
+
+		# pawn to queen (auto-promotion)
 		if (( fig == player && selectedNewY == ( player > 0 ? 7 : 0 ) )) ; then
 			field[$selectedNewY,$selectedNewX]=$(( 5 * player ))
 		fi
@@ -1482,6 +1884,9 @@ function inputCoord(){
 				inputY=$(( 8 - a ))
 				hoverY=$inputY
 				;;
+			[Ff] )
+				echo -e "\r\n\e[2mFEN: $(exportFen)\e[0m" >&2
+				;;
 			* )
 				bell
 				;;
@@ -1733,6 +2138,10 @@ function end() {
 	if $cursor ; then
 		echo -en "\e[2J\e[?47l\e[?25h\e[u\e8"
 	fi
+	# export FEN if requested
+	if $exportFen ; then
+		echo -e "\e[1mCurrent FEN:\e[0m $(exportFen)\n"
+	fi
 	# exit message
 	duration=$(( $( date +%s%N ) - timestamp ))
 	seconds=$(( duration / 1000000000 ))
@@ -1772,6 +2181,9 @@ title="Welcome to ChessBa.sh"
 if isAI "1" || isAI "-1" ; then
 	title="$title - your room heater tool!"
 fi
+if [[ -n "$fenString" ]] ; then
+	echo -e "\e[2mLoaded FEN: $fenString\e[0m"
+fi
 
 # permanent cache: import
 if [[ -n "$cache" && -f "$cache" ]] ; then
@@ -1786,7 +2198,7 @@ fi
 
 # main game loop
 {
-	p=1
+	p=$fenInitialP
 	while true ; do
 		# initialize remote connection on first run
 		if ! $initializedGameLoop ; then
